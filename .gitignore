@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Vector database — regenerated at runtime from uploaded PDFs
+data/chroma/
+
+# Uploaded documents — may contain personal data, not meant for source control
+data/documents/*
+!data/documents/.gitkeep
+
+# macOS
+.DS_Store
