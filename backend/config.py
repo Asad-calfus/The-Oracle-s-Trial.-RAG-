@@ -28,6 +28,11 @@ LLM_MODEL = "gpt-4o-mini"
 # question is worded differently from the document's own text.
 RETRIEVAL_TOP_K = 6
 
+# How many chunks to fetch BEFORE reranking — a wider, rougher pool for the
+# reranker to choose from. Must be >= RETRIEVAL_TOP_K, since reranking only
+# narrows this pool down, never grows it.
+RERANK_CANDIDATE_K = 15
+
 # Chroma gives every retrieved chunk a "distance" score — LOWER means MORE
 # similar. Real tests showed the "relevant" and "irrelevant" score ranges
 # overlap (a genuinely relevant resume chunk scored 1.3-1.66 depending on

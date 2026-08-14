@@ -1,13 +1,12 @@
 import os
 
-from langchain_openai import ChatOpenAI
-
 from backend.config import (
-    LLM_MODEL,
-    OPENAI_API_KEY,
+    RERANK_CANDIDATE_K,
     RETRIEVAL_TOP_K,
     SIMILARITY_SCORE_THRESHOLD,
 )
+from backend.llm import get_llm
+from backend.reranker import rerank_chunks
 from backend.vectorstore import get_vectorstore
 
 
@@ -17,19 +16,10 @@ def retrieve_documents(question: str):
     return store.similarity_search(question, k=RETRIEVAL_TOP_K)
 
 
-def retrieve_with_scores(question: str):
+def retrieve_with_scores(question: str, k: int = RETRIEVAL_TOP_K):
     """Same as retrieve_documents, but also return each chunk's similarity score."""
     store = get_vectorstore()
-    return store.similarity_search_with_score(question, k=RETRIEVAL_TOP_K)
-
-
-def get_llm():
-    """Return the chat model used to generate answers."""
-    return ChatOpenAI(
-        model=LLM_MODEL,
-        api_key=OPENAI_API_KEY,
-        temperature=0.7,
-    )
+    return store.similarity_search_with_score(question, k=k)
 
 
 # {context} and {question} are placeholders filled in by build_prompt() below.
@@ -81,16 +71,20 @@ def get_sources(chunks) -> list[dict]:
 
 
 def generate_answer(question: str) -> dict:
-    """Run the full query pipeline: retrieve -> filter weak matches -> LLM.
+    """Run the full query pipeline: retrieve -> filter weak matches -> rerank -> LLM.
 
     Returns {"answer": str, "sources": list[dict]} so the answer and its
     citations travel together as one structured result.
     """
-    results = retrieve_with_scores(question)
+    # Cast a WIDER net than before (RERANK_CANDIDATE_K, not RETRIEVAL_TOP_K)
+    # so a genuinely relevant chunk has a real chance of surviving even when
+    # other documents in the store are competing for the same top spots.
+    results = retrieve_with_scores(question, k=RERANK_CANDIDATE_K)
 
     # Drop chunks that aren't actually similar enough to be useful — our
-    # "weak evidence" check (Rule 16). This also covers the "zero chunks"
-    # case for free: an empty results list just produces an empty good_chunks.
+    # "weak evidence" check (Rule 16), now applied to that wider pool. This
+    # also covers the "zero chunks" case for free: an empty results list
+    # just produces an empty good_chunks.
     good_chunks = [
         chunk for chunk, score in results if score <= SIMILARITY_SCORE_THRESHOLD
     ]
@@ -101,11 +95,15 @@ def generate_answer(question: str) -> dict:
             "sources": [],
         }
 
-    prompt = build_prompt(question, good_chunks)
+    # Narrow the wide pool back down to the true best few, by relevance
+    # rather than raw embedding distance.
+    top_chunks = rerank_chunks(question, good_chunks)
+
+    prompt = build_prompt(question, top_chunks)
     llm = get_llm()
     response = llm.invoke(prompt)
 
     return {
         "answer": response.content,
-        "sources": get_sources(good_chunks),
+        "sources": get_sources(top_chunks),
     }

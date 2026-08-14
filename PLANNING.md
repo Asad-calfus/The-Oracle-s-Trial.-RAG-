@@ -59,65 +59,76 @@ Answer + Citation         → final answer + "Source: filename.pdf — Page X"
 ### Step-by-step explanation
 
 **PDF (input)**
+
 - What: raw uploaded file.
 - Why: it's the source of truth we want the system to answer from.
 - Input: a `.pdf` file.
 - Output: nothing yet — just stored/received.
 
 **Text Extraction**
+
 - What: pull plain text out of the PDF, one page at a time.
 - Why: PDFs are a binary/visual format; we need plain text before we can process language.
 - Input: PDF file.
 - Output: list of `(page_number, text)` pairs.
 
 **Chunking**
+
 - What: split each page's text into smaller overlapping pieces (e.g. ~700 characters each).
 - Why: a whole PDF (or even a whole page) is often too large and too "mixed topic" to embed usefully. Smaller chunks let us retrieve *just* the relevant paragraph, not an entire document. (Explained in depth in Step 5 — Rule 10 requires this.)
 - Input: extracted page text.
 - Output: list of small text chunks, each tagged with metadata (filename, page, chunk id).
 
 **Embeddings**
+
 - What: convert each text chunk into a vector — a list of numbers that represents its *meaning*. Similar meaning → similar vector (mathematically close).
 - Why: computers can't compare "meaning" of two sentences directly, but they can compare vectors using distance/similarity math. This is what lets us search "by meaning" instead of "by exact keyword".
 - Input: text chunk.
 - Output: a fixed-length numeric vector (e.g. 384 or 1536 numbers, depending on model).
 
 **ChromaDB (Vector Database)**
+
 - What: a database specialized for storing vectors + letting you search "find me the closest vectors to this one".
 - Why: a normal SQL database is not built for "similarity search" over thousands of numeric dimensions. ChromaDB stores the vector, the original chunk text, and its metadata together, and persists it to disk so it survives a restart.
 - Input: (vector, chunk text, metadata) triples.
 - Output: a searchable, persistent store on disk.
 
 **User Question**
+
 - What: the user types a natural language question.
 - Input: question string.
 - Output: nothing yet — just received.
 
 **Question Embedding**
+
 - What: the same embedding model converts the question into a vector.
 - Why: to compare the question against stored chunks, both must live in the same "vector space". Using a *different* embedding model here than during ingestion would make comparisons meaningless.
 - Input: question string.
 - Output: numeric vector.
 
 **Similarity Search**
+
 - What: ChromaDB compares the question's vector against all stored chunk vectors and returns the closest ones (commonly cosine similarity).
 - Why: this is the "Retrieval" in Retrieval-Augmented Generation — we're finding which existing chunks are most likely to contain the answer.
 - Input: question vector.
 - Output: top-K chunk IDs ranked by similarity.
 
 **Relevant Chunks**
+
 - What: the actual text + metadata (filename, page) for the top-K matches.
 - Why: this becomes the "evidence" we hand to the LLM, and later, the basis for citations.
 - Input: chunk IDs from similarity search.
 - Output: list of `{text, filename, page}`.
 
 **LLM (Generation)**
+
 - What: we build a prompt containing the question + the retrieved chunks, and ask the LLM to answer *using only that context*.
 - Why: the LLM is good at reading and summarizing language, but we don't want it inventing facts — so we constrain it to the evidence we retrieved.
 - Input: question + retrieved chunk texts.
 - Output: a natural language answer.
 
 **Answer + Citation**
+
 - What: we attach the metadata (filename, page) of the chunks that were actually used, next to the answer.
 - Why: citations must come from real metadata we tracked — never from the LLM guessing a filename/page, because it can hallucinate that too.
 - Input: LLM answer + chunk metadata.
@@ -334,11 +345,49 @@ ingest.py (writes), rag.py (reads)
 
 ```text
 File:
+backend/llm.py
+
+Purpose:
+get_llm() — the single place that builds the ChatOpenAI client (model
+name, API key, temperature).
+
+Why separate file:
+Both rag.py (answer generation) and reranker.py (reranking) need the
+exact same LLM client. Putting it in either of those two files would
+force the other to import from it, and since both already need to be
+importable by each other's caller, that risks a circular import.
+This small shared file removes that problem entirely.
+
+Used by:
+rag.py, reranker.py
+```
+
+```text
+File:
+backend/reranker.py
+
+Purpose:
+rerank_chunks() — takes a wider pool of candidate chunks and asks the
+LLM to reorder them by true relevance to the question, returning just
+the best few.
+
+Why separate file:
+Reranking is its own distinct concern (refining retrieval results),
+separate from generating the final answer — keeping it in its own
+file makes both easier to read on their own.
+
+Used by:
+rag.py (generate_answer() calls this after the initial retrieval)
+```
+
+```text
+File:
 backend/rag.py
 
 Purpose:
-The query pipeline: takes a question, retrieves relevant chunks via
-vectorstore.py, builds a strict prompt, calls the LLM, and returns
+The query pipeline: takes a question, retrieves a wide pool of
+candidate chunks via vectorstore.py, narrows it down via
+reranker.py, builds a strict prompt, calls the LLM, and returns
 an answer plus the source metadata used.
 
 Why separate file:
@@ -487,4 +536,268 @@ Before writing `config.py` itself, we'll first do **Step 1** (create the empty f
 
 ---
 
-**Stopping here as instructed.** No code or files beyond this planning doc have been created yet. Say **"next"** when you want me to start Step 1 (repository structure).
+## 9. Future Improvements (Beyond the Basic Version)
+
+The basic mandatory version (Steps 0-19 above) is complete: upload → chunk →
+embed → retrieve → generate → cite, with two layers of hallucination
+protection. Everything below is a **possible next phase** — none of it is
+built yet, this is just a plan of what could be added and why.
+
+### 9.1 Multi-user & Access Control
+
+- **Authentication (login/signup)** — right now anyone who opens the app has
+  full access; there's no concept of a "user" at all.
+- **RBAC (role-based access control)** — e.g. an *admin* role that can upload/
+  delete documents and see everything, vs a *regular user* role that can only
+  ask questions. Needed once more than one person uses the same deployment.
+- **Per-user document scoping** — each user's uploaded PDFs are only
+  searchable by that user (or by whoever they explicitly share with), instead
+  of one shared pool everyone's questions search across.
+- **Query history** — save each user's past questions + answers + sources to
+  a real database (not just Chroma), so they can revisit old answers instead
+  of re-asking.
+- **Upload audit log** — track who uploaded which file and when.
+
+### 9.2 Retrieval Quality
+
+- **Reranking** — after the initial top-K similarity search, run a dedicated
+  reranker model (e.g. a cross-encoder or a hosted rerank API) over those
+  candidates to re-score them by actual relevance. Embedding similarity alone
+  is a rough signal (we saw this ourselves — score ranges overlapped between
+  relevant and irrelevant chunks); a reranker reads the question and chunk
+  together and is much better at judging true relevance.
+- **Hybrid search (keyword + semantic)** — combine exact keyword search
+  (BM25) with vector similarity search. Pure semantic search can miss exact
+  matches (names, IDs, specific terms) that keyword search would catch
+  instantly.
+- **Query rewriting** — before retrieval, expand or rephrase a short/vague
+  question into a few fuller variants and search with all of them. Directly
+  addresses the "different phrasing gives worse results" issue we hit with
+  the resume test.
+- **Document-summary chunk** — generate and store one extra "summary" chunk
+  per document at ingestion time, specifically so broad questions like "what
+  is this document about" have something real to retrieve — this was a
+  known gap in the basic version.
+- **Document-scoped questions** — let the user pick "search only this PDF"
+  instead of always searching across every uploaded document.
+
+### 9.3 Document Parsing
+
+- **Better PDF parsing** — swap/augment `PyPDFLoader` with a layout-aware
+  parser (e.g. `unstructured`) that handles tables, multi-column layouts, and
+  headers more accurately instead of flattening everything into one text
+  stream.
+- **OCR for scanned/image-based PDFs** — `PyPDFLoader` only reads embedded
+  text; a scanned document (or a resume exported as an image) currently
+  produces no usable text at all. An OCR step (e.g. Tesseract, or a
+  vision-capable LLM) would fix this.
+- **Other file types** — `.docx`, `.txt`, `.pptx`, images — currently PDF-only.
+- **Semantic/structure-aware chunking** — split by section/heading instead of
+  a fixed character count, so a chunk doesn't cut a table or a paragraph in
+  half.
+
+### 9.4 User Experience
+
+- **Conversational memory** — let follow-up questions ("what about his
+  education?" after asking about a resume) use the previous question as
+  context, instead of every question being treated as brand new.
+- **Show retrieved chunks / scores** — a transparency/debug view so the user
+  can see exactly which chunks and scores were used for a given answer.
+- **Highlight the exact answer snippet**, not just the filename/page.
+- **Manage documents from the UI** — list/delete uploaded PDFs without
+  touching the server's filesystem directly.
+- **Upload progress indicator** for large PDFs.
+
+### 9.5 Engineering & Reliability
+
+- **De-dup on upload** — detect if an identical file was already ingested
+  and skip/replace instead of adding duplicate chunks (a real issue we hit
+  and worked around manually, not yet fixed at the code level).
+- **Background ingestion** — large PDFs currently block the `/upload` request
+  until fully processed; a task queue (e.g. Celery, or a simple background
+  task) would make uploads feel instant.
+- **Automated tests** — unit tests for chunking, retrieval, and citation
+  logic, so a future change can't silently break something we already fixed.
+- **An evaluation set** — a fixed list of test questions with known-correct
+  answers/sources, run automatically to measure retrieval/answer quality
+  over time, instead of the ad-hoc manual testing we've been doing so far.
+- **Logging & monitoring** — track questions asked, latency, and errors.
+- **Containerization (Docker)** — for easier/reproducible deployment.
+
+### 9.6 Security
+
+- **Sanitize uploaded filenames** — `/upload` currently builds the save path
+  directly from the client-supplied filename; a crafted filename (e.g. with
+  `../` in it) could write outside the intended folder. Worth validating/
+  sanitizing before this ever runs somewhere untrusted.
+- **File validation** — enforce a max upload size and check it's actually a
+  PDF, not just trust the extension/content-type.
+- **API rate limiting / cost control** — every question costs a real OpenAI
+  API call; without limits, one user (or a bug/loop) could run up unexpected
+  cost.
+
+---
+
+**Status:** the basic mandatory version described above (Sections 1-8) is
+built and pushed to GitHub. Section 9 is an unbuilt wishlist. Section 10
+below is the detailed implementation plan for the item we've decided to
+build next: **reranking**.
+
+---
+
+## 10. Reranking — Implementation Plan (Next Version)
+
+### 10.1 The Problem This Solves
+
+Right now, retrieval is **one stage**: embed the question, compare it
+against every stored chunk vector, take the top-K closest by distance. This
+is fast, but approximate — an embedding compresses meaning into a fixed list
+of numbers, so some nuance is lost. We saw this ourselves: the same resume
+question, worded two different ways, produced very different scores for the
+exact same correct chunk (1.3 vs 1.66).
+
+### 10.2 The Concept: Two-Stage Retrieval
+
+```text
+Stage 1 (existing) — RECALL            Stage 2 (new) — PRECISION
+"cast a wide net, cheaply"             "carefully judge the shortlist"
+
+Question                                Wider candidate set (e.g. top 15)
+   │                                          │
+   ▼                                          ▼
+Embed question                          For each candidate, judge its
+   │                                    actual relevance to the exact
+   ▼                                    question (slower, smarter check)
+Compare to ALL stored vectors                │
+   │                                          ▼
+   ▼                                    Re-sort by this new relevance
+Top ~15 closest chunks                  score, keep the real top-K
+(rough, fast)                           (accurate, small)
+```
+
+Analogy: Stage 1 is a librarian quickly grabbing 15 books that look related
+by skimming titles. Stage 2 is actually reading the first paragraph of each
+of those 15 to pick the true best few. You can't afford to "read the first
+paragraph" of every book in the library (too slow) — but you can afford it
+for a shortlist of 15.
+
+### 10.3 Tech Choice: LLM-Based Reranking
+
+**Decision: reuse the existing `gpt-4o-mini` model (already wired up via
+`ChatOpenAI` in `rag.py`) to do the reranking — no new library, no new
+API key, no new account.**
+
+How: after retrieving a wider candidate pool (e.g. top 15 instead of top 6),
+send the question + all 15 candidate chunks to the LLM in a single prompt,
+and ask it to return the most relevant ones in order. Only those get passed
+to the existing answer-generation step — nothing downstream changes.
+
+**Alternatives considered, and why not these (for now):**
+
+- **Local cross-encoder model** (`sentence-transformers`, e.g.
+  `cross-encoder/ms-marco-MiniLM-L-6-v2`) — the standard production pattern,
+  free per-query, but pulls in a heavy new dependency (PyTorch) and a model
+  download. More setup than the basic version needs right now.
+- **Cohere Rerank API** — a dedicated hosted reranking service, simple to
+  call, but requires signing up for a completely separate account/API key
+  just for this one feature.
+- Both are reasonable *later* upgrades if the LLM-based approach turns out
+  too slow/expensive/inaccurate — noted here so we don't forget the option.
+
+**Tradeoff of the chosen approach:** one extra LLM call per question (for
+the reranking step, on top of the existing answer-generation call), so
+slightly slower and slightly more expensive per query — but zero new
+infrastructure.
+
+### 10.4 Where This Fits in the Existing Pipeline
+
+```text
+Before:
+  retrieve_with_scores() [top 6]  →  score-threshold filter  →  LLM answer
+
+After:
+  retrieve_with_scores() [top 15, WIDER]  →  rerank_chunks() [NEW]  →  keep top 6  →  LLM answer
+```
+
+`rerank_chunks()` lives in its own file, `backend/reranker.py`, rather than
+inside `rag.py` — this keeps the reranking logic (its own distinct concern)
+readable on its own, the same way ingestion and vector-store logic already
+each get their own file. This required pulling `get_llm()` out into a new
+`backend/llm.py` too: both `rag.py` (answer generation) and
+`reranker.py` (reranking) need the same LLM client, and having either file
+import the other directly would create a circular import — `backend/llm.py`
+is the shared dependency both of them import from instead.
+
+```text
+backend/llm.py        - get_llm() — shared by rag.py and reranker.py
+backend/reranker.py   - RERANK_PROMPT_TEMPLATE, build_rerank_prompt(), rerank_chunks()
+backend/rag.py         - retrieval, answer prompt, citations, generate_answer()
+```
+
+### 10.5 Step-by-Step Build Plan
+
+Same small-step approach as the rest of this project — one piece at a time,
+testing each layer independently before wiring it into `generate_answer()`.
+
+```text
+STEP R1   Add a new config value for the wider candidate pool
+          (e.g. RERANK_CANDIDATE_K = 15), separate from RETRIEVAL_TOP_K.
+
+STEP R2   Write the reranking prompt template: given the question and a
+          numbered list of candidate chunks, ask the LLM to return the
+          IDs of the most relevant ones, in order.
+
+STEP R3   Write rerank_chunks(question, chunks) in rag.py: sends that
+          prompt to the LLM, parses which chunk IDs it picked, and
+          returns just those chunks in relevance order.
+
+STEP R4   Test rerank_chunks() on its own — print what it picks for a
+          few known questions, compare against the plain embedding
+          ranking, before touching generate_answer() at all.
+
+STEP R5   Wire it into generate_answer(): widen the initial retrieval to
+          RERANK_CANDIDATE_K, pass the results through rerank_chunks(),
+          then feed the result into the existing build_prompt() / LLM
+          call exactly as before.
+
+STEP R6   Re-run the same test questions we've already used (iso27001,
+          FAQ, resume — including the differently-phrased resume
+          question that struggled before) and compare answers/sources
+          before vs after.
+```
+
+Nothing about `build_prompt()`, `get_sources()`, or the FastAPI/Streamlit
+layers changes — reranking only affects *which* chunks reach the LLM, not
+what happens after that.
+
+### 10.6 Real-World Finding That Confirms Why This Matters
+
+While testing Step R4 (`rerank_chunks()` standalone), we hit a live example
+of the exact problem reranking is meant to fix:
+
+- With **only the resume** in the store, "what is the name of the person in
+  this resume?" gave a correct answer.
+- After also uploading `Calfus_Intern_FAQ.pdf`, the **same kind of question**
+  started returning "I don't know based on the uploaded documents." again.
+
+Cause: `generate_answer()` still only pulls the top **6** chunks
+(`RETRIEVAL_TOP_K`), and now those 6 slots are shared across every document
+in the store. The FAQ has many chunks; when they happen to score closer to
+the question than the resume's chunk does, they crowd the resume out of the
+top 6 entirely — reranking can't rescue a chunk that was never even
+retrieved. This is a general scaling problem: a fixed, small top-K gets
+"thinner" per document as more documents are added.
+
+This makes **Step R5 (not yet done)** more important, not optional — widening
+the initial pull to `RERANK_CANDIDATE_K` (15) before reranking gives the
+resume's chunk a much better chance of surviving into the candidate pool in
+the first place.
+
+**Also worth prioritizing sooner rather than later (already listed in
+Section 9.2, "Document-scoped questions"):** let the user restrict a
+question to one specific uploaded document (e.g. a "search only in:
+resume.pdf" selector in the UI), using Chroma's metadata filter (it can
+filter by the `source` field we already store). This removes cross-document
+competition entirely rather than just widening the net — the more documents
+get uploaded over time, the more this becomes the real fix rather than a
+nice-to-have.

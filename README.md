@@ -12,9 +12,10 @@ Upload flow:
       -> store in ChromaDB (with source file, page, chunk_id metadata)
 
 Question flow:
-  Question -> embed -> find top-K most similar chunks in ChromaDB
+  Question -> embed -> find a WIDE pool of similar chunks in ChromaDB
       -> drop chunks that aren't similar enough (score filter)
-      -> send remaining chunks + question to the LLM (strict prompt)
+      -> rerank the survivors, keep the true best few
+      -> send those chunks + question to the LLM (strict prompt)
       -> return answer + citations (from chunk metadata, not the LLM)
 ```
 
@@ -29,6 +30,8 @@ backend/
   config.py       - all settings in one place (paths, models, thresholds)
   ingest.py       - PDF -> text -> chunks -> vector store
   vectorstore.py  - opens/writes to the Chroma vector database
+  llm.py          - builds the shared LLM client (used by rag.py + reranker.py)
+  reranker.py     - reorders candidate chunks by asking the LLM to judge relevance
   rag.py          - retrieval + hallucination checks + LLM call + citations
   main.py         - FastAPI app: /health, /upload, /query
 frontend/
@@ -77,13 +80,22 @@ Open the URL Streamlit prints, upload a PDF, then ask a question.
   its source filename, page number, and a chunk id.
 
 - **Retrieval** (`rag.py`): the question is embedded the same way, and
-  Chroma returns the `RETRIEVAL_TOP_K` most similar chunks, each with a
-  distance score (lower = more similar).
+  Chroma returns a wider pool of `RERANK_CANDIDATE_K` similar chunks, each
+  with a distance score (lower = more similar) — wider than what's actually
+  sent to the LLM, so a relevant chunk still has a chance even when many
+  documents are competing for the same top spots.
+
+- **Reranking** (`reranker.py`): that wider candidate pool is handed to the
+  LLM directly, along with the question, and it's asked to pick out and
+  order the truly most relevant ones (`RETRIEVAL_TOP_K` of them). This is
+  more accurate than raw embedding distance alone, since the LLM actually
+  reads each candidate against the exact question instead of just comparing
+  vector positions.
 
 - **Hallucination protection — two independent layers:**
   1. *Score filter*: chunks with a distance above
-     `SIMILARITY_SCORE_THRESHOLD` are dropped before they ever reach the
-     LLM.
+     `SIMILARITY_SCORE_THRESHOLD` are dropped before they ever reach
+     reranking or the LLM.
   2. *Strict prompt*: the LLM is instructed to answer **only** from the
      given context, and to reply exactly `"I don't know based on the
      uploaded documents."` if the answer isn't there. This catches cases
