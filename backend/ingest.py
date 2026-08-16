@@ -4,7 +4,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from backend.config import CHUNK_SIZE, CHUNK_OVERLAP
-from backend.vectorstore import add_chunks_to_store
+from backend.vectorstore import add_chunks_to_store, delete_document
 
 
 # loading the pdf using the pypdfloader lab
@@ -35,13 +35,23 @@ def split_documents(documents):
     return chunks
 
 
-def ingest_pdf(file_path: str) -> int:
+def ingest_pdf(file_path: str) -> dict:
     """Run the full ingestion pipeline for one PDF: load -> chunk -> embed -> store.
 
-    Returns the number of chunks created, so callers (e.g. the /upload
-    endpoint) can report it back to the user.
+    Re-uploading a file REPLACES its existing chunks rather than adding a
+    second copy beside them — otherwise the same document accumulates
+    duplicates every time it's uploaded, inflating both the chunk count and
+    the retrieval results.
+
+    Returns {"chunks": int, "replaced": int} so the /upload endpoint can tell
+    the user what actually happened.
     """
+    file_path = os.path.abspath(file_path)
+
+    replaced = delete_document(file_path)
+
     documents = load_pdf(file_path)
     chunks = split_documents(documents)
     add_chunks_to_store(chunks)
-    return len(chunks)
+
+    return {"chunks": len(chunks), "replaced": replaced}

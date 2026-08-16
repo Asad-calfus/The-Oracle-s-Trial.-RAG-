@@ -801,3 +801,139 @@ filter by the `source` field we already store). This removes cross-document
 competition entirely rather than just widening the net — the more documents
 get uploaded over time, the more this becomes the real fix rather than a
 nice-to-have.
+
+---
+
+## 11. UI Overhaul — Implementation Plan
+
+The current `frontend/app.py` is deliberately minimal: an upload box, a text
+box, and one answer printed below. It works, but it has real gaps — you
+can't see what's already uploaded, every question wipes the previous answer,
+and there's no notion of a conversation at all.
+
+### 11.1 The One Concept That Shapes This Whole Plan
+
+**Streamlit re-runs the entire script from top to bottom on every single
+interaction** — every button click, every text input, every file upload.
+Normal Python variables are wiped and recreated each time.
+
+The only thing that survives a rerun is **`st.session_state`** — a
+dictionary Streamlit keeps alive for as long as that browser tab's session
+lives. So anything the UI needs to *remember* (chat history, which thread is
+open, which documents are selected) has to live in `st.session_state`.
+
+Two consequences worth knowing upfront:
+
+- **Good news for "different users without login":** `st.session_state` is
+  already **per browser session**. Two people opening the app get completely
+  separate `session_state` dictionaries automatically — no login needed for
+  their *chats* to stay separate.
+- **Honest limitation:** ChromaDB is **still one shared pool**. Person A's
+  uploaded PDF is searchable by Person B's questions, because chunks aren't
+  tagged with who uploaded them. Truly isolating documents per user requires
+  either real login, or tagging each chunk with a session id and filtering
+  on it — a bigger change, noted here rather than assumed away.
+- **`session_state` dies on refresh.** Close the tab or hit reload, and the
+  chat threads are gone. Making them survive needs real storage on the
+  backend (covered in Phase U5 below).
+
+### 11.2 What You Asked For
+
+**A) Multiple chat threads** (like ChatGPT's sidebar — "New chat", switch
+between past chats).
+- Each thread = a title + a list of messages (question, answer, sources).
+- Kept in `st.session_state` as a dict of threads plus "which one is active".
+- Auto-name each thread from its first question so the sidebar is readable.
+
+**B) A visible list of uploaded documents**, so the user knows what the
+system is actually searching.
+- This needs a **new backend endpoint** — the frontend currently has no way
+  to ask "what's in the store?". A `GET /documents` endpoint would read the
+  distinct `source` values out of Chroma's metadata (the same
+  `store.get()` call we already used while debugging) and return each
+  filename plus its chunk count.
+- Worth pairing with the **duplicate-upload fix** (Section 9.5): the moment
+  we render this list, any duplicate ingestion becomes visible to the user,
+  so it stops being a hidden annoyance and starts being a visible bug.
+
+### 11.3 Additional Suggestions
+
+Ordered by how much value they add relative to effort:
+
+1. **Chat-style message display** (`st.chat_message` / `st.chat_input`
+   instead of a text box + `st.write`). This is the single biggest visual
+   upgrade and it's mostly free — Streamlit has these built in. Threads
+   (feature A) barely make sense without it.
+2. **Document scoping selector** — checkboxes/multiselect over the document
+   list: "search only in these PDFs". This is the *root-cause* fix for the
+   crowding problem from Section 10.6, not just a UI nicety. Requires
+   `/query` to accept an optional list of filenames and pass a Chroma
+   metadata filter down into retrieval.
+3. **Loading spinners** (`st.spinner`) during upload and query. Right now a
+   large PDF upload or a slow query just looks frozen — and reranking made
+   every query *slower* (two LLM calls instead of one), so this matters more
+   now than it did before.
+4. **Expandable "sources" section** showing the actual retrieved chunk text,
+   not just filename + page. Turns citations from "trust me" into "here's
+   the exact text I read" — and doubles as the debugging view we've been
+   building by hand in the terminal all along.
+5. **Delete a document from the UI** — needs a `DELETE /documents/{filename}`
+   endpoint that removes those chunks from Chroma by metadata filter.
+   Currently the only way to clean up is deleting `data/chroma/` and
+   re-uploading everything.
+6. **Better error surfaces** — the backend being down currently produces a
+   raw `requests` exception trace in the UI. A clear "backend not reachable,
+   is uvicorn running?" message would save real debugging time.
+
+### 11.4 Phased Build Plan
+
+Each phase is independently useful and testable — same one-step-at-a-time
+approach as the rest of this project.
+
+```text
+PHASE U1  Chat-style layout (frontend only, no backend changes)
+          Replace the text box with st.chat_input, render past
+          question/answer pairs as chat bubbles from session_state.
+
+PHASE U2  Multiple threads (frontend only)
+          Sidebar: "New chat" button + a list of past threads.
+          session_state holds {thread_id: {title, messages}} plus
+          the active thread id. Auto-title from the first question.
+
+PHASE U3  Document list (needs backend)
+          New GET /documents endpoint reading distinct sources from
+          Chroma metadata. Sidebar section listing each uploaded PDF
+          and its chunk count. Pair with the dedup fix on /upload.
+
+PHASE U4  Document scoping (needs backend + a small rag.py change)
+          Multiselect over that document list; /query accepts an
+          optional list of filenames; retrieval passes a Chroma
+          metadata filter so only those documents are searched.
+
+PHASE U5  Persistence (bigger — needs real storage)
+          Move threads out of session_state into SQLite behind
+          /threads endpoints, so chats survive a page refresh.
+          Only worth doing once U1-U4 feel right.
+
+PHASE U6  Conversational memory (rag.py change, not a UI change)
+          Let follow-up questions ("what about his education?") use
+          earlier turns as context — needs the question rewritten
+          with history before retrieval, since the raw follow-up on
+          its own retrieves nothing useful.
+```
+
+### 11.5 What Changes Where
+
+```text
+Phase   frontend/app.py   backend/main.py   backend/rag.py   new files
+U1      yes               —                 —                —
+U2      yes               —                 —                —
+U3      yes               yes (/documents)  —                —
+U4      yes               yes (/query)      yes (filter)     —
+U5      yes               yes (/threads)    —                storage module
+U6      —                 —                 yes              —
+```
+
+U1 and U2 touch **only** the frontend — the backend contract stays exactly
+as it is today. That's deliberate: it means the biggest visible improvement
+carries the least risk of breaking the RAG pipeline we've already tested.

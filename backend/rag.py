@@ -1,6 +1,8 @@
 import os
+from typing import Optional
 
 from backend.config import (
+    DOCUMENTS_DIR,
     RERANK_CANDIDATE_K,
     RETRIEVAL_TOP_K,
     SIMILARITY_SCORE_THRESHOLD,
@@ -10,16 +12,38 @@ from backend.reranker import rerank_chunks
 from backend.vectorstore import get_vectorstore
 
 
+def build_source_filter(filenames: Optional[list[str]]) -> Optional[dict]:
+    """Turn a list of filenames into a Chroma metadata filter, or None for "all".
+
+    Chunks store `source` as the full path they were ingested from, while the
+    UI only ever knows the bare filename. Uploads always land in
+    DOCUMENTS_DIR, so the full path is reconstructible from the name.
+    """
+    if not filenames:
+        return None
+
+    paths = [os.path.join(DOCUMENTS_DIR, filename) for filename in filenames]
+    return {"source": {"$in": paths}}
+
+
 def retrieve_documents(question: str):
     """Return the top-K most relevant chunks for a question via similarity search."""
     store = get_vectorstore()
     return store.similarity_search(question, k=RETRIEVAL_TOP_K)
 
 
-def retrieve_with_scores(question: str, k: int = RETRIEVAL_TOP_K):
-    """Same as retrieve_documents, but also return each chunk's similarity score."""
+def retrieve_with_scores(
+    question: str,
+    k: int = RETRIEVAL_TOP_K,
+    source_filter: Optional[dict] = None,
+):
+    """Same as retrieve_documents, but also return each chunk's similarity score.
+
+    source_filter, when given, restricts the search to specific documents
+    instead of every chunk in the store.
+    """
     store = get_vectorstore()
-    return store.similarity_search_with_score(question, k=k)
+    return store.similarity_search_with_score(question, k=k, filter=source_filter)
 
 
 # {context} and {question} are placeholders filled in by build_prompt() below.
@@ -70,8 +94,11 @@ def get_sources(chunks) -> list[dict]:
     return sources
 
 
-def generate_answer(question: str) -> dict:
+def generate_answer(question: str, sources: Optional[list[str]] = None) -> dict:
     """Run the full query pipeline: retrieve -> filter weak matches -> rerank -> LLM.
+
+    `sources` optionally restricts the search to specific uploaded filenames;
+    leaving it empty searches everything.
 
     Returns {"answer": str, "sources": list[dict]} so the answer and its
     citations travel together as one structured result.
@@ -79,7 +106,11 @@ def generate_answer(question: str) -> dict:
     # Cast a WIDER net than before (RERANK_CANDIDATE_K, not RETRIEVAL_TOP_K)
     # so a genuinely relevant chunk has a real chance of surviving even when
     # other documents in the store are competing for the same top spots.
-    results = retrieve_with_scores(question, k=RERANK_CANDIDATE_K)
+    results = retrieve_with_scores(
+        question,
+        k=RERANK_CANDIDATE_K,
+        source_filter=build_source_filter(sources),
+    )
 
     # Drop chunks that aren't actually similar enough to be useful — our
     # "weak evidence" check (Rule 16), now applied to that wider pool. This
