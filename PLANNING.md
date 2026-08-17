@@ -841,12 +841,14 @@ Two consequences worth knowing upfront:
 
 **A) Multiple chat threads** (like ChatGPT's sidebar — "New chat", switch
 between past chats).
+
 - Each thread = a title + a list of messages (question, answer, sources).
 - Kept in `st.session_state` as a dict of threads plus "which one is active".
 - Auto-name each thread from its first question so the sidebar is readable.
 
 **B) A visible list of uploaded documents**, so the user knows what the
 system is actually searching.
+
 - This needs a **new backend endpoint** — the frontend currently has no way
   to ask "what's in the store?". A `GET /documents` endpoint would read the
   distinct `source` values out of Chroma's metadata (the same
@@ -911,9 +913,10 @@ PHASE U4  Document scoping (needs backend + a small rag.py change)
           metadata filter so only those documents are searched.
 
 PHASE U5  Persistence (bigger — needs real storage)
-          Move threads out of session_state into SQLite behind
+          Move threads out of session_state into a database behind
           /threads endpoints, so chats survive a page refresh.
           Only worth doing once U1-U4 feel right.
+          (Detailed plan in Section 12 — using PostgreSQL.)
 
 PHASE U6  Conversational memory (rag.py change, not a UI change)
           Let follow-up questions ("what about his education?") use
@@ -937,3 +940,109 @@ U6      —                 —                 yes              —
 U1 and U2 touch **only** the frontend — the backend contract stays exactly
 as it is today. That's deliberate: it means the biggest visible improvement
 carries the least risk of breaking the RAG pipeline we've already tested.
+
+---
+
+## 12. Phase U5: Persistence with PostgreSQL — Implementation Plan
+
+### 12.1 The Problem
+
+Chat threads currently live in `st.session_state`, which exists only for as
+long as a browser tab's session does. Refresh the page and every thread is
+gone. To survive, they have to live **outside the frontend entirely** — on
+the backend, in a real database.
+
+### 12.2 Why PostgreSQL (and the honest tradeoff)
+
+SQLite would be simpler here: it's just a file, no server to install or
+keep running, and for a single-user local app it would be entirely
+sufficient. PostgreSQL is a deliberate choice for the *learning* value —
+it's a real client/server database, it's what production deployments
+actually use, and it handles multiple concurrent users properly.
+
+**The tradeoff nobody should skip over:** moving threads into a shared
+database *removes* the accidental per-user isolation we currently get for
+free.
+
+```text
+Today (session_state):   separate chats per browser, but lost on refresh
+After Postgres:          chats survive forever, but EVERYONE sees the same list
+```
+
+`session_state` is per-browser-session, so two people opening the app never
+see each other's chats. A shared Postgres database has no such boundary —
+without login, there's nothing to tell one person's threads from another's.
+Options, from cheapest to most correct:
+
+1. **Accept it** — fine for a single-user project or a mentor demo.
+2. **Add an `owner` column** plus a "who are you?" name box — a poor man's
+   login. Honest about being unenforced, but keeps lists separate.
+3. **Real authentication** (Section 9.1) — the actual fix, bigger scope.
+
+We're taking option 1 for now, with the column design left compatible with
+option 2 if we want it later.
+
+### 12.3 Schema Design
+
+Two tables, a classic one-to-many relationship:
+
+```text
+threads
+  id          SERIAL PRIMARY KEY
+  title       TEXT NOT NULL              -- auto-named from the first question
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+
+messages
+  id          SERIAL PRIMARY KEY
+  thread_id   INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE
+  role        TEXT NOT NULL              -- 'user' or 'assistant'
+  content     TEXT NOT NULL
+  sources     JSONB                      -- citations; assistant messages only
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+```
+
+Design decisions worth stating:
+
+- **`sources` as JSONB, not a third table.** Citations are a list of
+  `{filename, page}` that only ever exist to be displayed under their own
+  message — they're never queried across messages. A separate table would
+  add a join for no benefit, and JSONB already matches the exact shape the
+  API returns.
+- **`ON DELETE CASCADE`** so deleting a thread automatically takes its
+  messages with it, rather than leaving orphaned rows behind.
+- **`created_at` on both tables** so threads can be listed newest-first and
+  messages replayed in the order they were actually sent.
+- **`SERIAL` ids instead of the frontend's counter.** The database assigns
+  ids now, which means two browsers creating threads at the same time can't
+  collide — something the old `next_thread_id` counter could not guarantee.
+
+### 12.4 Step-by-Step Build Plan
+
+```text
+STEP P1   Create the database, add DATABASE_URL to .env / .env.example
+          and config.py, add the psycopg driver to requirements.txt.
+          No application logic yet — just plumbing.
+
+STEP P2   backend/database.py — get_connection() plus init_db(), which
+          creates both tables if they don't already exist.
+
+STEP P3   Thread functions — create_thread(title) and list_threads().
+          Test them standalone before any endpoint exists.
+
+STEP P4   Message functions — add_message(...) and get_messages(thread_id).
+
+STEP P5   FastAPI endpoints — POST /threads, GET /threads,
+          GET /threads/{id}/messages, and /query gains an optional
+          thread_id so it persists both messages itself.
+
+STEP P6   Frontend — read and write threads through those endpoints
+          instead of session_state.
+```
+
+### 12.5 What Does NOT Change
+
+The entire RAG pipeline — `ingest.py`, `vectorstore.py`, `reranker.py`,
+`rag.py` — is untouched by this phase. Persistence is purely about
+remembering conversations; it has nothing to do with how answers are found
+or generated. The one exception is `/query` gaining an optional `thread_id`
+parameter, and even that leaves `generate_answer()` itself unchanged.

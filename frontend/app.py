@@ -7,31 +7,11 @@ API_BASE_URL = "http://127.0.0.1:8001"
 st.set_page_config(page_title="SmartDoc", page_icon="📄")
 st.title("SmartDoc — Document Q&A")
 
-# Streamlit re-runs this whole script top-to-bottom on every interaction, so
-# normal variables are wiped each time. session_state is the only thing that
-# survives a rerun — which makes it the only place chat history can live.
-if "threads" not in st.session_state:
-    st.session_state.threads = {}
+# Chat history now lives in Postgres, not in the browser — so the only thing
+# session_state still has to remember is which thread is open. None means
+# "a new chat that hasn't been saved yet".
 if "active_thread_id" not in st.session_state:
     st.session_state.active_thread_id = None
-if "next_thread_id" not in st.session_state:
-    st.session_state.next_thread_id = 1
-
-
-def create_thread():
-    """Open a new empty chat and make it the active one.
-
-    If the current thread is still empty, we just stay on it — otherwise
-    clicking "New chat" repeatedly would stack up identical blank threads.
-    """
-    active_id = st.session_state.active_thread_id
-    if active_id is not None and not st.session_state.threads[active_id]["messages"]:
-        return
-
-    thread_id = st.session_state.next_thread_id
-    st.session_state.next_thread_id += 1
-    st.session_state.threads[thread_id] = {"title": "New chat", "messages": []}
-    st.session_state.active_thread_id = thread_id
 
 
 def render_sources(sources):
@@ -43,26 +23,38 @@ def render_sources(sources):
         st.caption(f"- {source['filename']} — Page {source['page']}")
 
 
-# There must always be one thread open for the user to type into.
-if st.session_state.active_thread_id is None:
-    create_thread()
+def fetch(path):
+    """GET a backend endpoint, returning None if the backend isn't reachable.
+
+    These run on EVERY rerun, so an unreachable backend would otherwise crash
+    the page on load rather than just failing the one action that needed it.
+    """
+    try:
+        response = requests.get(f"{API_BASE_URL}{path}")
+        return response.json() if response.ok else None
+    except requests.RequestException:
+        return None
+
 
 # The sidebar is rendered BEFORE the chat area on purpose: switching threads
 # happens here, and the chat below needs to already know which one to draw.
 with st.sidebar:
     if st.button("➕ New chat", use_container_width=True):
-        create_thread()
+        # Nothing is written to the database yet. The thread row is created
+        # only when a first question actually arrives, so empty chats never
+        # pile up in the sidebar.
+        st.session_state.active_thread_id = None
 
-    for thread_id, thread in reversed(list(st.session_state.threads.items())):
-        is_active = thread_id == st.session_state.active_thread_id
+    for thread in fetch("/threads") or []:
+        is_active = thread["id"] == st.session_state.active_thread_id
         # key= is required because several buttons can share the same label.
         if st.button(
             thread["title"],
-            key=f"thread-{thread_id}",
+            key=f"thread-{thread['id']}",
             use_container_width=True,
             type="primary" if is_active else "secondary",
         ):
-            st.session_state.active_thread_id = thread_id
+            st.session_state.active_thread_id = thread["id"]
             # Buttons above this one in the loop were already drawn using the
             # OLD active id, so their highlighting is stale — rerun to redraw
             # the whole sidebar consistently.
@@ -91,13 +83,7 @@ with st.sidebar:
     # immediately, rather than one interaction late.
     st.header("Documents in use")
     selected_sources = []
-    try:
-        documents_response = requests.get(f"{API_BASE_URL}/documents")
-        documents = documents_response.json() if documents_response.ok else []
-    except requests.RequestException:
-        # Unlike upload/query, this call runs on EVERY rerun — so a backend
-        # that isn't running would otherwise crash the whole page on load.
-        documents = None
+    documents = fetch("/documents")
 
     if documents is None:
         st.warning("Backend not reachable. Is uvicorn running?")
@@ -115,29 +101,33 @@ with st.sidebar:
             placeholder="All documents",
         )
 
-# Mutating this dict mutates session_state directly — it's a reference, not a copy.
-active_thread = st.session_state.threads[st.session_state.active_thread_id]
+# Read the active thread AFTER the sidebar, since the sidebar is what changes it.
+active_thread_id = st.session_state.active_thread_id
 
-# Redraw the whole conversation from scratch on every rerun — Streamlit only
-# shows what this script renders right now, so past messages have to be
-# replayed explicitly rather than staying on screen by themselves.
-for message in active_thread["messages"]:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
-        if message["role"] == "assistant":
-            render_sources(message.get("sources", []))
+# Replay the conversation from the database. Streamlit only shows what this
+# script renders right now, so past messages have to be drawn explicitly
+# rather than staying on screen by themselves.
+if active_thread_id is not None:
+    for message in fetch(f"/threads/{active_thread_id}/messages") or []:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            if message["role"] == "assistant":
+                render_sources(message["sources"] or [])
 
 # chat_input pins itself to the bottom of the page and returns the submitted
 # text once, then None on the reruns that follow.
 question = st.chat_input("Ask a question about your documents")
 if question:
-    # Name the thread after its first question so the sidebar is readable.
-    if not active_thread["messages"]:
-        active_thread["title"] = (
-            question if len(question) <= 40 else question[:40] + "…"
-        )
+    # A brand new chat has no row yet — create it now, named after this first
+    # question so the sidebar entry is readable.
+    if active_thread_id is None:
+        title = question if len(question) <= 40 else question[:40] + "…"
+        created = requests.post(f"{API_BASE_URL}/threads", json={"title": title})
+        active_thread_id = created.json()["id"]
+        st.session_state.active_thread_id = active_thread_id
 
-    active_thread["messages"].append({"role": "user", "content": question})
+    # Show the question straight away so the user isn't staring at a blank
+    # screen while the answer is being generated.
     with st.chat_message("user"):
         st.write(question)
 
@@ -145,23 +135,16 @@ if question:
         with st.spinner("Thinking..."):
             response = requests.post(
                 f"{API_BASE_URL}/query",
-                json={"question": question, "sources": selected_sources},
+                json={
+                    "question": question,
+                    "sources": selected_sources,
+                    "thread_id": active_thread_id,
+                },
             )
 
         if response.ok:
-            data = response.json()
-            st.write(data["answer"])
-            render_sources(data["sources"])
-            active_thread["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": data["answer"],
-                    "sources": data["sources"],
-                }
-            )
+            # The backend already saved both messages, so rerun and let the
+            # replay loop above read them back — no second copy kept here.
+            st.rerun()
         else:
-            error_message = f"Query failed: {response.text}"
-            st.error(error_message)
-            active_thread["messages"].append(
-                {"role": "assistant", "content": error_message, "sources": []}
-            )
+            st.error(f"Query failed: {response.text}")

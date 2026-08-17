@@ -6,9 +6,12 @@ from backend.llm import get_llm
 # only let it choose from what we already have.
 RERANK_PROMPT_TEMPLATE = """You will be given a question and a numbered list of text passages.
 
-Rank the passages by how relevant they are to answering the question, from most relevant to least relevant.
+Select the passages that actually help answer the question, and list them from most relevant to least relevant.
 
-Return ONLY a comma-separated list of the passage numbers in that order, for example: 3,1,4,2
+LEAVE OUT any passage that does not help answer the question — do not include it just to fill the list.
+If none of the passages help, return nothing at all.
+
+Return ONLY a comma-separated list of the selected passage numbers, for example: 3,1,4
 Do not include any other text, explanation, or the passage contents themselves.
 
 Question:
@@ -17,7 +20,7 @@ Question:
 Passages:
 {passages}
 
-Ranked passage numbers:"""
+Selected passage numbers:"""
 
 
 def build_rerank_prompt(question: str, chunks) -> str:
@@ -29,12 +32,15 @@ def build_rerank_prompt(question: str, chunks) -> str:
 
 
 def rerank_chunks(question: str, chunks):
-    """Reorder candidate chunks by asking the LLM to judge relevance directly.
+    """Pick the chunks that actually help answer the question, best first.
 
-    Returns the top RETRIEVAL_TOP_K chunks, in relevance order. Falls back to
-    the original (embedding-similarity) order if the LLM's reply can't be
-    parsed into valid passage numbers — reranking should never be able to
-    break the pipeline, only improve it.
+    Returns at most RETRIEVAL_TOP_K chunks, and possibly none — irrelevant
+    candidates are dropped rather than kept to pad the list, so they can't
+    end up cited as evidence for an answer they had no part in.
+
+    Falls back to the original (embedding-similarity) order if the LLM's
+    reply can't be parsed into valid passage numbers — reranking should
+    never be able to break the pipeline, only improve it.
     """
     if not chunks:
         return chunks
@@ -42,10 +48,16 @@ def rerank_chunks(question: str, chunks):
     prompt = build_rerank_prompt(question, chunks)
     llm = get_llm()
     response = llm.invoke(prompt)
+    reply = response.content.strip()
+
+    # An empty reply is the model deliberately saying "none of these help",
+    # which is a real answer — not a parsing failure to fall back from.
+    if not reply:
+        return []
 
     ranked_chunks = []
     seen_indices = set()
-    for token in response.content.split(","):
+    for token in reply.split(","):
         token = token.strip()
         if not token.isdigit():
             continue
@@ -54,6 +66,7 @@ def rerank_chunks(question: str, chunks):
             seen_indices.add(index)
             ranked_chunks.append(chunks[index])
 
+    # Non-empty reply that yielded no usable numbers => we failed to read it.
     if not ranked_chunks:
         return chunks[:RETRIEVAL_TOP_K]
 

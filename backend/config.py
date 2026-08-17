@@ -8,6 +8,12 @@ load_dotenv()
 # --- Secrets ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# --- Database ---
+# PostgreSQL connection string for chat thread persistence. Read from .env
+# rather than hardcoded, since it differs per machine (and can contain a
+# password, which must never end up in source control).
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 # --- Paths ---
 # Computed relative to this file so the project works no matter where it's cloned.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +38,12 @@ RETRIEVAL_TOP_K = 6
 # reranker to choose from. Must be >= RETRIEVAL_TOP_K, since reranking only
 # narrows this pool down, never grows it.
 RERANK_CANDIDATE_K = 15
+
+# --- Conversational memory ---
+# How many past chat messages the question-rewriter gets to see. Enough to
+# resolve "he"/"it"/"that document" from recent turns, small enough to keep
+# the extra LLM call cheap.
+REWRITE_HISTORY_MESSAGES = 6
 
 # Chroma gives every retrieved chunk a "distance" score — LOWER means MORE
 # similar. Real tests showed the "relevant" and "irrelevant" score ranges

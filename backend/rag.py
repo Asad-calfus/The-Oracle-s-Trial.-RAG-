@@ -9,6 +9,7 @@ from backend.config import (
 )
 from backend.llm import get_llm
 from backend.reranker import rerank_chunks
+from backend.rewriter import rewrite_question
 from backend.vectorstore import get_vectorstore
 
 
@@ -44,6 +45,18 @@ def retrieve_with_scores(
     """
     store = get_vectorstore()
     return store.similarity_search_with_score(question, k=k, filter=source_filter)
+
+
+NO_ANSWER_RESPONSE = "I don't know based on the uploaded documents."
+
+
+def is_no_answer(answer: str) -> bool:
+    """True when the LLM declined to answer.
+
+    A prefix check rather than an exact match: the model reproduces the
+    sentence closely but not always character-for-character.
+    """
+    return answer.strip().lower().startswith("i don't know")
 
 
 # {context} and {question} are placeholders filled in by build_prompt() below.
@@ -94,20 +107,30 @@ def get_sources(chunks) -> list[dict]:
     return sources
 
 
-def generate_answer(question: str, sources: Optional[list[str]] = None) -> dict:
-    """Run the full query pipeline: retrieve -> filter weak matches -> rerank -> LLM.
+def generate_answer(
+    question: str,
+    sources: Optional[list[str]] = None,
+    history: Optional[list[dict]] = None,
+) -> dict:
+    """Run the full query pipeline: rewrite -> retrieve -> filter -> rerank -> LLM.
 
     `sources` optionally restricts the search to specific uploaded filenames;
-    leaving it empty searches everything.
+    leaving it empty searches everything. `history` is the thread's earlier
+    messages, used only to resolve what a follow-up question refers to.
 
-    Returns {"answer": str, "sources": list[dict]} so the answer and its
+    Returns {"answer", "sources", "rewritten_question"} so the answer and its
     citations travel together as one structured result.
     """
+    # Resolve "he" / "it" / "that document" against earlier turns BEFORE
+    # searching — a raw follow-up like "what about his education?" contains
+    # no name to match on, so retrieval on it alone finds nothing useful.
+    search_question = rewrite_question(question, history or [])
+
     # Cast a WIDER net than before (RERANK_CANDIDATE_K, not RETRIEVAL_TOP_K)
     # so a genuinely relevant chunk has a real chance of surviving even when
     # other documents in the store are competing for the same top spots.
     results = retrieve_with_scores(
-        question,
+        search_question,
         k=RERANK_CANDIDATE_K,
         source_filter=build_source_filter(sources),
     )
@@ -122,19 +145,35 @@ def generate_answer(question: str, sources: Optional[list[str]] = None) -> dict:
 
     if not good_chunks:
         return {
-            "answer": "I don't know based on the uploaded documents.",
+            "answer": NO_ANSWER_RESPONSE,
             "sources": [],
+            "rewritten_question": search_question,
         }
 
     # Narrow the wide pool back down to the true best few, by relevance
-    # rather than raw embedding distance.
-    top_chunks = rerank_chunks(question, good_chunks)
+    # rather than raw embedding distance. Can come back empty if the reranker
+    # judges that none of the candidates are actually relevant.
+    top_chunks = rerank_chunks(search_question, good_chunks)
 
-    prompt = build_prompt(question, top_chunks)
+    if not top_chunks:
+        return {
+            "answer": NO_ANSWER_RESPONSE,
+            "sources": [],
+            "rewritten_question": search_question,
+        }
+
+    # Answer the REWRITTEN question, not the original: the raw follow-up
+    # still says "his", and the LLM has no history here to work that out.
+    prompt = build_prompt(search_question, top_chunks)
     llm = get_llm()
     response = llm.invoke(prompt)
+    answer = response.content
 
     return {
-        "answer": response.content,
-        "sources": get_sources(top_chunks),
+        "answer": answer,
+        # Citations mean "here is the evidence for this answer". When there is
+        # no answer, showing them anyway implies support that doesn't exist.
+        "sources": [] if is_no_answer(answer) else get_sources(top_chunks),
+        "rewritten_question": search_question,
     }
+
