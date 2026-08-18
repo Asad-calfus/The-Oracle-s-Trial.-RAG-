@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 import psycopg
@@ -5,6 +6,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from backend.config import DATABASE_URL
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection():
@@ -62,10 +65,12 @@ def create_thread(title: str) -> dict:
     assigned — so we don't need a second query to find out what that id was.
     """
     with get_connection() as conn:
-        return conn.execute(
+        thread = conn.execute(
             "INSERT INTO threads (title) VALUES (%s) RETURNING id, title",
             (title,),
         ).fetchone()
+    logger.info("Created thread id=%s title=%r", thread["id"], thread["title"])
+    return thread
 
 
 def list_threads() -> list[dict]:
@@ -89,7 +94,7 @@ def add_message(
     back converts it into a Python list again automatically.
     """
     with get_connection() as conn:
-        return conn.execute(
+        message = conn.execute(
             """
             INSERT INTO messages (thread_id, role, content, sources)
             VALUES (%s, %s, %s, %s)
@@ -97,6 +102,8 @@ def add_message(
             """,
             (thread_id, role, content, Jsonb(sources) if sources else None),
         ).fetchone()
+    logger.debug("Saved %s message id=%s to thread_id=%s", role, message["id"], thread_id)
+    return message
 
 
 def get_messages(thread_id: int) -> list[dict]:

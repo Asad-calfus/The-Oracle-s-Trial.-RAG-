@@ -1,5 +1,9 @@
+import logging
+
 from backend.config import RETRIEVAL_TOP_K
 from backend.llm import get_llm
+
+logger = logging.getLogger(__name__)
 
 # The LLM is asked to return ONLY passage numbers (never the passage text
 # itself) — same principle as citations: never let the LLM retype content,
@@ -49,10 +53,12 @@ def rerank_chunks(question: str, chunks):
     llm = get_llm()
     response = llm.invoke(prompt)
     reply = response.content.strip()
+    logger.debug("Reranker LLM reply for %d candidates: %r", len(chunks), reply)
 
     # An empty reply is the model deliberately saying "none of these help",
     # which is a real answer — not a parsing failure to fall back from.
     if not reply:
+        logger.info("Reranker selected 0 of %d candidates", len(chunks))
         return []
 
     ranked_chunks = []
@@ -68,6 +74,12 @@ def rerank_chunks(question: str, chunks):
 
     # Non-empty reply that yielded no usable numbers => we failed to read it.
     if not ranked_chunks:
+        logger.warning(
+            "Could not parse any passage numbers from reranker reply %r — "
+            "falling back to embedding-similarity order",
+            reply,
+        )
         return chunks[:RETRIEVAL_TOP_K]
 
+    logger.info("Reranker selected %d of %d candidates", len(ranked_chunks), len(chunks))
     return ranked_chunks[:RETRIEVAL_TOP_K]

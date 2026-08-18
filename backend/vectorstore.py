@@ -1,9 +1,12 @@
+import logging
 import os
 
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
 from backend.config import CHROMA_DIR, EMBEDDING_MODEL, OPENAI_API_KEY
+
+logger = logging.getLogger(__name__)
 
 
 def get_embedding_model():
@@ -26,6 +29,7 @@ def add_chunks_to_store(chunks):
     """Embed the given chunks and persist them to the Chroma collection."""
     store = get_vectorstore()
     store.add_documents(chunks)
+    logger.debug("Added %d chunks to the vector store", len(chunks))
 
 
 def delete_document(source_path: str) -> int:
@@ -41,26 +45,30 @@ def delete_document(source_path: str) -> int:
 
     if ids:
         store.delete(ids=ids)
+        logger.debug("Deleted %d existing chunks for %s", len(ids), source_path)
 
     return len(ids)
 
 
-def list_documents() -> list[dict]:
-    """Return every ingested document as {filename, chunks}, sorted by name.
+def list_documents(thread_id: int) -> list[dict]:
+    """Return {filename, chunks} for one thread's documents only, sorted by name.
 
     Built by counting the `source` metadata we attach during ingestion, since
     Chroma has no separate notion of "a document" — it only stores chunks.
+    Filtering by thread_id is what keeps one chat's document list from
+    showing files that were actually uploaded into a different chat.
     """
     store = get_vectorstore()
-    # Pulls the whole collection into memory. Fine at this project's scale;
-    # a large corpus would want a proper per-document index instead.
-    data = store.get()
+    # Pulls this thread's slice of the collection into memory. Fine at this
+    # project's scale; a large corpus would want a proper index instead.
+    data = store.get(where={"thread_id": thread_id})
 
     counts = {}
     for metadata in data["metadatas"]:
         filename = os.path.basename(metadata.get("source", "unknown"))
         counts[filename] = counts.get(filename, 0) + 1
 
+    logger.debug("thread_id=%s has %d distinct documents", thread_id, len(counts))
     return [
         {"filename": filename, "chunks": chunk_count}
         for filename, chunk_count in sorted(counts.items())

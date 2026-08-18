@@ -1,6 +1,8 @@
 import os
 from dotenv import load_dotenv
 
+from backend.logging_config import setup_logging
+
 # Load variables from .env into the process environment.
 # Without this, os.getenv() below would not see anything from .env.
 load_dotenv()
@@ -19,6 +21,17 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCUMENTS_DIR = os.path.join(BASE_DIR, "data", "documents")
 CHROMA_DIR = os.path.join(BASE_DIR, "data", "chroma")
+LOGS_DIR = os.path.join(BASE_DIR, "data", "logs")
+
+# --- Logging ---
+# DEBUG by default so every pipeline step is visible; override in .env
+# (e.g. LOG_LEVEL=INFO) to quiet it down without touching code.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
+
+# Runs once, the first time ANY module in backend/ is imported — config.py
+# is imported by everything else, making it the natural bootstrap point
+# (it already does the same thing for load_dotenv() above).
+setup_logging(LOGS_DIR, LOG_LEVEL)
 
 # --- Chunking (Rule 10: initial guess, not a tuned value) ---
 CHUNK_SIZE = 700

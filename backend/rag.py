@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Optional
 
@@ -12,19 +13,39 @@ from backend.reranker import rerank_chunks
 from backend.rewriter import rewrite_question
 from backend.vectorstore import get_vectorstore
 
+logger = logging.getLogger(__name__)
 
-def build_source_filter(filenames: Optional[list[str]]) -> Optional[dict]:
-    """Turn a list of filenames into a Chroma metadata filter, or None for "all".
 
-    Chunks store `source` as the full path they were ingested from, while the
-    UI only ever knows the bare filename. Uploads always land in
-    DOCUMENTS_DIR, so the full path is reconstructible from the name.
+def build_source_filter(
+    thread_id: Optional[int],
+    filenames: Optional[list[str]] = None,
+) -> Optional[dict]:
+    """Build a Chroma metadata filter scoping search to one thread's documents.
+
+    thread_id is the mandatory scope — it's what keeps one chat's uploads
+    invisible to every other chat's questions. filenames optionally narrows
+    further, to specific files within that same thread (Phase U4's "search
+    only in" selector). The two combine with $and when both are present.
     """
-    if not filenames:
-        return None
+    conditions = []
 
-    paths = [os.path.join(DOCUMENTS_DIR, filename) for filename in filenames]
-    return {"source": {"$in": paths}}
+    if thread_id is not None:
+        conditions.append({"thread_id": thread_id})
+
+        if filenames:
+            # Uploads land in DOCUMENTS_DIR/{thread_id}/{filename} (Step T2),
+            # so the full path is only reconstructible when thread_id is known.
+            paths = [
+                os.path.join(DOCUMENTS_DIR, str(thread_id), filename)
+                for filename in filenames
+            ]
+            conditions.append({"source": {"$in": paths}})
+
+    if not conditions:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
 
 
 def retrieve_documents(question: str):
@@ -109,18 +130,24 @@ def get_sources(chunks) -> list[dict]:
 
 def generate_answer(
     question: str,
+    thread_id: Optional[int] = None,
     sources: Optional[list[str]] = None,
     history: Optional[list[dict]] = None,
 ) -> dict:
     """Run the full query pipeline: rewrite -> retrieve -> filter -> rerank -> LLM.
 
-    `sources` optionally restricts the search to specific uploaded filenames;
-    leaving it empty searches everything. `history` is the thread's earlier
-    messages, used only to resolve what a follow-up question refers to.
+    `thread_id` scopes the search to one chat's own uploaded documents —
+    leaving it out searches every chunk in the store, regardless of thread
+    (mainly useful for ad-hoc/standalone testing). `sources` optionally
+    narrows further to specific filenames within that thread. `history` is
+    the thread's earlier messages, used only to resolve what a follow-up
+    question refers to.
 
     Returns {"answer", "sources", "rewritten_question"} so the answer and its
     citations travel together as one structured result.
     """
+    logger.info("Question for thread_id=%s: %r (sources=%s)", thread_id, question, sources)
+
     # Resolve "he" / "it" / "that document" against earlier turns BEFORE
     # searching — a raw follow-up like "what about his education?" contains
     # no name to match on, so retrieval on it alone finds nothing useful.
@@ -132,7 +159,12 @@ def generate_answer(
     results = retrieve_with_scores(
         search_question,
         k=RERANK_CANDIDATE_K,
-        source_filter=build_source_filter(sources),
+        source_filter=build_source_filter(thread_id, sources),
+    )
+    logger.debug(
+        "Retrieved %d candidates, scores=%s",
+        len(results),
+        [round(score, 3) for _, score in results],
     )
 
     # Drop chunks that aren't actually similar enough to be useful — our
@@ -144,6 +176,7 @@ def generate_answer(
     ]
 
     if not good_chunks:
+        logger.info("No candidates passed the score threshold — answering 'I don't know'")
         return {
             "answer": NO_ANSWER_RESPONSE,
             "sources": [],
@@ -156,6 +189,7 @@ def generate_answer(
     top_chunks = rerank_chunks(search_question, good_chunks)
 
     if not top_chunks:
+        logger.info("Reranker kept 0 chunks — answering 'I don't know'")
         return {
             "answer": NO_ANSWER_RESPONSE,
             "sources": [],
@@ -168,6 +202,7 @@ def generate_answer(
     llm = get_llm()
     response = llm.invoke(prompt)
     answer = response.content
+    logger.info("Answered using %d chunks (declined=%s)", len(top_chunks), is_no_answer(answer))
 
     return {
         "answer": answer,

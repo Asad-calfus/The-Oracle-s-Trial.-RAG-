@@ -1,0 +1,542 @@
+/* SmartDoc — paper-and-ink. Warm off-white, one rust accent, hairline rules,
+   serif for anything the documents actually say. No shadows, no gradients:
+   depth comes from the rules and the spacing. */
+
+:root {
+  --paper: #faf8f4;
+  --rail: #f3f0e9;
+  --ink: #1a1815;
+  --ink-soft: #56504a;
+  --ink-faint: #8d867c;
+  --rule: #e3ddd3;
+  --rust: #9c4221;
+
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
+    Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial,
+    sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body,
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+li {
+  margin: 0;
+  padding: 0;
+}
+
+ul,
+ol {
+  list-style: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--sans);
+  color: var(--ink);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(156, 66, 33, 0.14);
+}
+
+/* Outlines are removed from the controls below, so this puts a visible one
+   back for anyone navigating by keyboard. */
+:focus-visible {
+  outline: 1px solid var(--rust);
+  outline-offset: 3px;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 17rem 1fr;
+  height: 100dvh;
+}
+
+/* ── Rail ─────────────────────────────────────────────────────────────── */
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 2.25rem;
+  padding: 1.75rem 1.25rem 2rem;
+  background: var(--rail);
+  border-right: 1px solid var(--rule);
+  overflow-y: auto;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.brand__name {
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+}
+
+/* The one flash of colour in the wordmark. */
+.brand__name::after {
+  content: ".";
+  color: var(--rust);
+}
+
+.label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.625rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+}
+
+.ghost {
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);
+  border-bottom: 1px solid transparent;
+  padding-bottom: 1px;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+
+.ghost:hover {
+  color: var(--rust);
+  border-bottom-color: var(--rust);
+}
+
+.thread,
+.doc {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.375rem 0.5rem 0.375rem 0.625rem;
+  border-left: 2px solid transparent;
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  color: var(--ink-soft);
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.thread {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thread:hover,
+.doc:hover {
+  color: var(--ink);
+  background: rgba(26, 24, 21, 0.03);
+}
+
+.thread.is-active {
+  color: var(--ink);
+  border-left-color: var(--rust);
+  background: rgba(26, 24, 21, 0.04);
+}
+
+.doc {
+  display: flex;
+  align-items: baseline;
+  gap: 0.625rem;
+  color: var(--ink-faint);
+}
+
+.doc__name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc__count {
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.doc.is-picked {
+  color: var(--ink);
+  border-left-color: var(--rust);
+}
+
+.hint,
+.note {
+  margin-top: 0.625rem;
+  padding-left: 0.625rem;
+  font-size: 0.6875rem;
+  line-height: 1.55;
+  color: var(--ink-faint);
+}
+
+.note.is-bad {
+  color: var(--rust);
+}
+
+/* ── Page ─────────────────────────────────────────────────────────────── */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.stream {
+  flex: 1;
+  overflow-y: auto;
+  padding: 3.5rem 2rem 2.5rem;
+}
+
+.stream__inner {
+  max-width: 40rem;
+  margin: 0 auto;
+}
+
+/* A rule between turns instead of bubbles around them. */
+.turn + .turn {
+  margin-top: 3rem;
+  padding-top: 3rem;
+  border-top: 1px solid var(--rule);
+}
+
+.ask {
+  margin-bottom: 1.5rem;
+  padding-left: 1rem;
+  border-left: 2px solid var(--rust);
+  font-size: 0.9375rem;
+  font-weight: 500;
+  line-height: 1.55;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+
+.prose {
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.7;
+  color: #262220;
+}
+
+.prose p + p,
+.prose ul,
+.prose ol {
+  margin-top: 1rem;
+}
+
+.prose ul,
+.prose ol {
+  margin-bottom: 1rem;
+  padding-left: 1.25rem;
+}
+
+.prose ul {
+  list-style: disc;
+}
+
+.prose ol {
+  list-style: decimal;
+}
+
+.prose li {
+  margin: 0.375rem 0;
+  padding-left: 0.25rem;
+}
+
+.prose li::marker {
+  color: var(--ink-faint);
+}
+
+.prose h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-family: var(--sans);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);
+}
+
+.prose strong {
+  font-weight: 600;
+}
+
+.prose code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: rgba(26, 24, 21, 0.05);
+  padding: 0.1em 0.35em;
+  border-radius: 2px;
+}
+
+/* Citations sit under a short rule, like a footnote line. */
+.cites {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.5rem;
+  margin-top: 1.75rem;
+  padding-top: 1rem;
+  font-size: 0.75rem;
+}
+
+.cites::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 2.5rem;
+  height: 1px;
+  background: var(--rust);
+  opacity: 0.45;
+}
+
+.cites li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  color: var(--ink-soft);
+}
+
+.cites em {
+  font-style: normal;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.thinking {
+  display: flex;
+  gap: 0.3rem;
+  padding: 0.5rem 0;
+}
+
+.thinking i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.thinking i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.thinking i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.2;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+.failure {
+  padding-left: 0.875rem;
+  border-left: 2px solid var(--rust);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--rust);
+}
+
+/* ── Empty state ──────────────────────────────────────────────────────── */
+
+.empty {
+  padding-top: 10vh;
+}
+
+.empty__title {
+  font-family: var(--serif);
+  font-size: 1.875rem;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+.empty__rule {
+  width: 2.5rem;
+  height: 1px;
+  margin: 1.5rem 0;
+  background: var(--rust);
+}
+
+.empty__text {
+  max-width: 26rem;
+  font-size: 0.875rem;
+  line-height: 1.75;
+  color: var(--ink-soft);
+}
+
+.empty__text + .empty__text {
+  margin-top: 0.75rem;
+  color: var(--ink-faint);
+}
+
+kbd {
+  font-family: var(--sans);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  background: rgba(26, 24, 21, 0.05);
+  border-radius: 2px;
+  padding: 0.1em 0.4em;
+}
+
+/* ── Composer ─────────────────────────────────────────────────────────── */
+
+.composer {
+  border-top: 1px solid var(--rule);
+  padding: 1rem 2rem 1.5rem;
+  background: var(--paper);
+}
+
+.scope {
+  max-width: 40rem;
+  margin: 0 auto 0.625rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ink-faint);
+}
+
+.scope b {
+  font-weight: 500;
+  color: var(--rust);
+}
+
+.composer__inner {
+  display: flex;
+  align-items: flex-end;
+  gap: 1.25rem;
+  max-width: 40rem;
+  margin: 0 auto;
+}
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  border: 0;
+  outline: none;
+  background: none;
+  padding: 0.5rem 0;
+  max-height: 12rem;
+  font-family: var(--sans);
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+.composer textarea::placeholder {
+  color: var(--ink-faint);
+}
+
+.send {
+  padding-bottom: 0.75rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--rust);
+  transition: color 0.12s ease;
+}
+
+.send:disabled {
+  color: var(--rule);
+  cursor: default;
+}
+
+/* ── Offline notice ───────────────────────────────────────────────────── */
+
+.offline {
+  margin-bottom: 2rem;
+  padding-left: 0.875rem;
+  border-left: 2px solid var(--rust);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--rust);
+}
+
+/* ── Scrollbars ───────────────────────────────────────────────────────── */
+
+.stream::-webkit-scrollbar,
+.rail::-webkit-scrollbar {
+  width: 11px;
+}
+
+.stream::-webkit-scrollbar-thumb,
+.rail::-webkit-scrollbar-thumb {
+  background: #dcd5c9;
+  border-radius: 11px;
+  border: 3px solid var(--paper);
+}
+
+.rail::-webkit-scrollbar-thumb {
+  border-color: var(--rail);
+}
+
+/* ── Narrow screens ───────────────────────────────────────────────────── */
+
+@media (max-width: 52rem) {
+  .app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+  }
+
+  .rail {
+    flex-direction: row;
+    gap: 1.75rem;
+    padding: 1rem 1.25rem;
+    border-right: 0;
+    border-bottom: 1px solid var(--rule);
+    overflow-x: auto;
+  }
+
+  .rail > * {
+    flex: 0 0 auto;
+    min-width: 12rem;
+  }
+
+  .stream {
+    padding: 2rem 1.25rem;
+  }
+
+  .composer {
+    padding: 1rem 1.25rem 1.25rem;
+  }
+}

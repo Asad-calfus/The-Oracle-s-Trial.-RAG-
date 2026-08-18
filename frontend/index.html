@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SmartDoc</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='5' fill='%239c4221'/><rect x='9' y='8' width='14' height='2.5' fill='%23faf8f4'/><rect x='9' y='14' width='14' height='2.5' fill='%23faf8f4'/><rect x='9' y='20' width='8' height='2.5' fill='%23faf8f4'/></svg>"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+
+  <body>
+    <div class="app">
+      <aside class="rail">
+        <header class="brand">
+          <h1 class="brand__name">SmartDoc</h1>
+          <button class="ghost" id="new-chat">New chat</button>
+        </header>
+
+        <section>
+          <p class="label">Conversations</p>
+          <ul class="threads" id="threads"></ul>
+        </section>
+
+        <section>
+          <p class="label">
+            Documents
+            <button class="ghost" id="add-pdf">Add PDF</button>
+          </p>
+          <ul class="docs" id="documents"></ul>
+          <p class="hint" id="doc-hint"></p>
+          <p class="note" id="note" hidden></p>
+          <!-- Hidden because the "Add PDF" button above is the real control;
+               the browser's own file input can't be styled to match. -->
+          <input type="file" id="file" accept="application/pdf" hidden />
+        </section>
+      </aside>
+
+      <main class="page">
+        <div class="stream" id="stream">
+          <div class="stream__inner" id="stream-inner"></div>
+        </div>
+
+        <form class="composer" id="composer">
+          <p class="scope" id="scope" hidden></p>
+          <div class="composer__inner">
+            <textarea
+              id="question"
+              rows="1"
+              placeholder="Ask a question about your documents"
+              autofocus
+            ></textarea>
+            <button class="send" id="send" type="submit" disabled>Ask</button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

@@ -626,10 +626,11 @@ built yet, this is just a plan of what could be added and why.
 
 ### 9.6 Security
 
-- **Sanitize uploaded filenames** — `/upload` currently builds the save path
-  directly from the client-supplied filename; a crafted filename (e.g. with
-  `../` in it) could write outside the intended folder. Worth validating/
-  sanitizing before this ever runs somewhere untrusted.
+- ~~**Sanitize uploaded filenames**~~ — **DONE.** `/upload` used to build the
+  save path straight from the client-supplied filename, so a crafted name
+  (e.g. with `../` in it) could have written outside the intended folder.
+  `safe_filename()` in `main.py` now reduces it to a bare basename and
+  rejects empty/`.`/`..` names.
 - **File validation** — enforce a max upload size and check it's actually a
   PDF, not just trust the extension/content-type.
 - **API rate limiting / cost control** — every question costs a real OpenAI
@@ -1046,3 +1047,318 @@ The entire RAG pipeline — `ingest.py`, `vectorstore.py`, `reranker.py`,
 remembering conversations; it has nothing to do with how answers are found
 or generated. The one exception is `/query` gaining an optional `thread_id`
 parameter, and even that leaves `generate_answer()` itself unchanged.
+
+---
+
+## 13. Per-Thread Document Isolation — Implementation Plan
+
+### 13.1 The Problem
+
+Today, ChromaDB is **one shared pool** — every uploaded PDF is searchable by
+every chat thread. "New chat" only resets what's shown on screen; it doesn't
+give you a clean slate to upload a fresh, unrelated set of documents into.
+The ask: clicking "New chat" should start completely empty, with its own
+upload box, and that chat should only ever search documents uploaded into
+*it* — not documents uploaded into any other chat.
+
+### 13.2 The Core Idea
+
+Tag every chunk with **which thread it belongs to**, and make that tag a
+**mandatory** filter on every search — on top of the existing optional
+"search only these specific files" filter from Phase U4.
+
+```text
+Today:     search across ALL chunks in the store (optionally narrowed to
+           specific files, if the user picked some)
+
+After:     search across ALL chunks belonging to THIS THREAD (optionally
+           narrowed further to specific files within that thread)
+```
+
+This reuses infrastructure that already exists — Chroma metadata filtering
+(built for Phase U4) and Postgres threads (built for Phase P) — rather than
+introducing anything new. The two filters combine with `$and` when both are
+present.
+
+### 13.3 Three Real Complications
+
+1. **Filename collisions across chats.** Two different chats could each
+   upload a file called `resume.pdf`. Today both would be saved to the same
+   `data/documents/resume.pdf` and overwrite each other. Fix: save uploads to
+   a **per-thread folder**, `data/documents/{thread_id}/{filename}`, so the
+   full path — which becomes the chunk's `source` metadata — is naturally
+   unique per thread. This also means `delete_document()` (used for
+   re-upload dedup) automatically stays thread-safe with no code change:
+   the path it matches on already can't collide across threads.
+2. **A thread must exist before its first upload, not just its first
+   question.** Right now a thread row is only created lazily when the first
+   *question* is asked. But the ask here is "New chat → immediately show an
+   upload box" — so uploading needs to be able to create the thread too,
+   using the same lazy-creation idea, just triggered by whichever comes
+   first: a question or an upload.
+3. **Old, already-ingested chunks have no `thread_id` at all.** Once the
+   filter becomes mandatory, chunks without a `thread_id` tag will never
+   match any thread's search — they become orphaned. We're **accepting
+   this** rather than writing migration/backfill code: it's a one-time,
+   easy-to-fix cost (just re-upload the PDFs you want into whichever new
+   chat should have them) that isn't worth the extra complexity of a
+   backfill script for a project at this stage.
+
+### 13.4 Step-by-Step Build Plan
+
+```text
+STEP T1   ingest_pdf(file_path, thread_id) tags every chunk's metadata
+          with thread_id. Test standalone: ingest the same file under two
+          different thread_ids, confirm two independently-tagged sets of
+          chunks exist side by side.
+
+STEP T2   /upload accepts thread_id as a form field, saves the file to
+          data/documents/{thread_id}/{filename} (creating that folder if
+          needed), and passes thread_id into ingest_pdf().
+
+STEP T3   Mandatory thread scoping in retrieval: the source-filter builder
+          in rag.py takes thread_id and combines it with any optional
+          per-file filter via $and. generate_answer() takes thread_id
+          through from /query, which already receives it today (currently
+          only used for history — now also used to scope the search).
+
+STEP T4   list_documents(thread_id) in vectorstore.py filters by
+          thread_id too; /documents takes a thread_id query parameter.
+
+STEP T5   Frontend: uploading when no thread is active creates one first
+          (named after the uploaded file, same lazy-creation pattern
+          already used for questions); the document list and "search only
+          in" selector only render once a thread exists, showing an empty
+          "upload a PDF to start this chat" state otherwise.
+
+STEP T6   End-to-end test: two separate chats, each given a different set
+          of uploaded PDFs, confirm neither chat's questions can retrieve
+          the other's documents.
+```
+
+### 13.5 What Does NOT Change
+
+Chunking, embedding, the reranker, the strict answer prompt, and citation
+logic are all untouched — this phase only changes *which chunks are
+eligible to be searched at all* for a given thread, not how retrieval,
+reranking, or answering work once that eligible set is decided.
+
+---
+
+## 14. Logging — Implementation Plan
+
+### 14.1 Why
+
+Right now the only way to see what the pipeline is doing internally
+(rewritten questions, retrieval scores, how many candidates the reranker
+kept, which endpoint got hit) is to reproduce it by hand with a `python3 -c`
+script — exactly what this whole project has been doing for debugging so
+far. Logging makes that visible automatically, live in the terminal and
+saved to a file for later.
+
+### 14.2 Design
+
+- **Python's built-in `logging` module** — no new dependency.
+- **One setup function**, `backend/logging_config.py`, called once from
+  `config.py` (which already runs setup code — `load_dotenv()` — at import
+  time, so it's the natural place). This avoids a circular import:
+  `logging_config.py` takes its settings as plain arguments rather than
+  importing `config.py` itself.
+- **Two handlers**: console (so the `uvicorn` terminal shows live activity)
+  and a rotating log file at `data/logs/app.log` (capped size, a few backups
+  kept — so history survives a restart without growing forever).
+- **Every module gets its own logger** via `logging.getLogger(__name__)`, so
+  each log line shows exactly which file it came from.
+- **`LOG_LEVEL`** in `config.py`, read from `.env`, defaulting to `DEBUG` as
+  asked. Third-party libraries (`httpx`, `openai`, etc.) are pinned to
+  `WARNING` regardless, since they're extremely noisy at `DEBUG` and would
+  drown out our own log lines.
+
+### 14.3 What Gets Logged Where
+
+```text
+ingest.py       PDF loaded, page count, chunk count, thread_id tag applied
+vectorstore.py  chunks added, chunks deleted (re-upload replace), documents listed
+rewriter.py     original question, rewritten question (or "unchanged, no history")
+rag.py          candidate count, scores, how many survived the threshold,
+                how many the reranker kept, final answer type (real vs "I don't know")
+reranker.py     the raw LLM reply and how many passage numbers were parsed from it
+database.py     thread created, message saved
+main.py         every endpoint hit, with its key parameters
+```
+
+### 14.4 Step-by-Step Build Plan
+
+```text
+STEP L1   backend/logging_config.py — setup_logging(logs_dir, level):
+          console handler + rotating file handler, shared formatter,
+          noisy third-party loggers turned down.
+
+STEP L2   config.py — add LOG_LEVEL (default "DEBUG") and LOGS_DIR, call
+          setup_logging() once at import time. Add data/logs/ to .gitignore.
+
+STEP L3   Instrument ingest.py + vectorstore.py.
+
+STEP L4   Instrument rag.py + reranker.py + rewriter.py.
+
+STEP L5   Instrument main.py + database.py.
+
+STEP L6   Test: run the app, watch the console live, then check
+          data/logs/app.log to confirm the same activity was recorded.
+```
+
+---
+
+## 15. OCR for Scanned/Image-Based PDFs — Implementation Plan
+
+### 15.1 The Problem
+
+`PyPDFLoader` only reads a PDF's **embedded text layer**. A scanned document
+(or a resume exported as a flat image) has no such layer — every page comes
+back with empty or near-empty text, so ingestion silently produces useless
+chunks and the document is effectively invisible to every question.
+
+### 15.2 The Core Idea (as actually built)
+
+Detection is a deterministic check on the page itself, via `pdfplumber` —
+not a guess from extracted text length. Two related but different
+questions are asked per page:
+
+```text
+PDF page
+  → pdfplumber opens the page and checks it directly:
+        does extract_text() return real text?
+        does the page actually contain embedded images (page.images)?
+  → is_image_page: no text AND has images -> fully-scanned page
+  → page_has_image: has images, regardless of text -> "mixed" page too
+
+  → page_has_image is False → use PyPDFLoader's extracted text as-is,
+    nothing else happens (unchanged, free, today's behavior)
+
+  → page_has_image is True (this is where the opt-in feature runs):
+        extract the page's image with pdfplumber
+        → send it to a vision-capable LLM, ask for a DETAILED TEXT
+          DESCRIPTION (verbatim text where present, plus a plain-language
+          description of non-text visual content — charts, diagrams,
+          stamps, tables-as-images, etc.)
+        → if is_image_page (no original text) → REPLACE page_content
+          with the description, since there was nothing else there
+        → if it's a "mixed" page (real text + a meaningful image) →
+          APPEND the description under the existing text, so a chart's
+          content becomes searchable without discarding the real text
+          already extracted
+
+  → from here on, nothing changes: the (possibly extended) text is
+    chunked with the existing splitter, embedded with the existing
+    embedding model, stored in the existing Chroma vector DB, retrieved
+    as normal text chunks, and cited by filename + page exactly like any
+    other chunk
+```
+
+This covers two real cases found during testing, not just "fully scanned
+documents": a resume exported as a flat image (fully-scanned case) AND a
+normal PDF that has a chart/diagram sitting next to real paragraph text
+(mixed case) — both were missing from the original single-case plan.
+
+### 15.3 Tech Choices
+
+**Vision LLM, not Tesseract** — use `gpt-4o-mini`'s vision capability
+(already our configured LLM) to read the page image, instead of a local
+OCR engine.
+- **Reuses existing infrastructure**: the same OpenAI client already
+  configured for embeddings/answers/reranking/rewriting now also handles
+  this — no new account, no new API key, no new model to manage.
+- **Tradeoff accepted**: costs one extra LLM call (with an image) per
+  image-containing page. Tesseract would be free and fully local, but
+  requires installing a separate system-level binary — extra setup
+  friction this project is choosing to avoid, the same reasoning as
+  choosing LLM-based reranking over a cross-encoder model (Section 10.3).
+
+**`pdfplumber`, not `pymupdf`** — both were tried and compared side by
+side on real project PDFs. Image counts disagreed between the two
+libraries in both directions depending on the document (one library
+found more on one PDF, the other found more on a different PDF), but the
+higher-level "which pages have images at all" signal was close between
+them either way. `pdfplumber` was kept as the single implementation to
+avoid running two overlapping libraries for the same job — no functional
+requirement forced this choice over the other.
+
+**Opt-in checkbox, not automatic** — the vision-LLM call for images only
+happens when the user explicitly checks "Describe images..." on upload
+(`include_images` — plumbed through the `/upload` form field,
+`ingest_pdf()`, and `load_pdf()`, default `False` end to end). A plain
+PDF upload with the box unchecked costs and behaves exactly as it did
+before this feature existed — no surprise LLM spend on every upload.
+
+### 15.4 Detection Method
+
+Two pdfplumber-backed checks in `backend/ocr.py`, both operating on the
+same page object, no text-length guessing involved:
+
+1. `is_image_page(file_path, page_number)` — `extract_text()` is empty
+   AND `page.images` is non-empty → the page has nothing but an image.
+2. `page_has_image(file_path, page_number)` — `page.images` is non-empty,
+   regardless of text → used to also catch "mixed" pages.
+
+A genuinely blank page has no text *and* no images, so both checks
+correctly leave it alone.
+
+### 15.5 Step-by-Step Build Plan (as actually built)
+
+```text
+STEP O1   backend/ocr.py — is_image_page(file_path, page_number) -> bool,
+          using pdfplumber. DONE.
+
+STEP O2   backend/ocr.py — extract_page_image(file_path, page_number) ->
+          bytes, rendering the page via pdfplumber's to_image() at 144
+          DPI. DONE.
+
+STEP O3   backend/ocr.py — describe_page_image(image_bytes) -> str,
+          sending the image to gpt-4o-mini for a detailed transcription +
+          non-text-content description. DONE.
+
+STEP O3.5 backend/ocr.py — page_has_image(file_path, page_number) -> bool,
+          added after testing surfaced the "mixed page" case that the
+          original single is_image_page() check couldn't catch. DONE.
+
+STEP O4   Wired into load_pdf() (backend/ingest.py), gated behind a new
+          include_images parameter (default False), threaded through
+          ingest_pdf() and the /upload endpoint's include_images form
+          field, with a frontend checkbox as the opt-in control. Replaces
+          content for fully-scanned pages, appends for mixed pages. Logs
+          which pages triggered it and whether it succeeded. DONE.
+
+STEP O5   Real test files used instead of a purpose-built one:
+          multimodal_rag_test.pdf (mixed text+image pages) and
+          worldhealthstatistics_2022.pdf (image-heavy real-world PDF).
+          DONE.
+
+STEP O6   End-to-end UI test: upload with the checkbox checked, ask a
+          question whose answer only exists in an image/chart, confirm a
+          real answer with a correct filename+page citation. IN PROGRESS
+          — do this next.
+```
+
+### 15.6 What Does NOT Change
+
+Chunking, embedding, retrieval, reranking, the answer prompt, and citations
+are all untouched — this feature is isolated entirely inside `load_pdf()`.
+Nothing downstream needs to know whether a page's text came from direct
+extraction, from OCR, or from an appended image description.
+
+### 15.7 Caveats Worth Knowing Going In
+
+- **Per-page cost**: a document with many image-containing pages means one
+  vision LLM call per such page when the checkbox is checked — noticeably
+  slower/costlier than a plain-text ingest. Rough cost: well under a cent
+  per page with `gpt-4o-mini`, but scales with page count.
+- **Rendering resolution matters**: if a description comes out garbled for
+  small fonts, the fix is usually increasing `extract_page_image()`'s
+  `resolution` (currently 144 DPI), not the prompt.
+- **Image-count detection is approximate across libraries**: `pdfplumber`
+  and `pymupdf` don't always agree on exact image counts on the same PDF —
+  harmless here, since the feature only cares about "does this page have
+  at least one image," where both libraries agreed closely.
+- **The detection heuristic is approximate**, not a guarantee — but a false
+  positive (running OCR on a page that didn't need it) is harmless, just a
+  wasted LLM call.

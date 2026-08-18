@@ -1,5 +1,9 @@
+import logging
+
 from backend.config import REWRITE_HISTORY_MESSAGES
 from backend.llm import get_llm
+
+logger = logging.getLogger(__name__)
 
 # The LLM rewrites the QUESTION only — it is never shown the documents here,
 # and never asked for facts. That keeps chat history out of the answer itself:
@@ -35,6 +39,7 @@ def rewrite_question(question: str, history) -> str:
     Falls back to the original if the LLM returns nothing usable.
     """
     if not history:
+        logger.debug("No history — skipping rewrite for: %r", question)
         return question
 
     prompt = REWRITE_PROMPT_TEMPLATE.format(
@@ -42,5 +47,11 @@ def rewrite_question(question: str, history) -> str:
         question=question,
     )
     response = get_llm().invoke(prompt)
+    rewritten = response.content.strip() or question
 
-    return response.content.strip() or question
+    if rewritten != question:
+        logger.info("Rewrote question %r -> %r", question, rewritten)
+    else:
+        logger.debug("Question already standalone: %r", question)
+
+    return rewritten

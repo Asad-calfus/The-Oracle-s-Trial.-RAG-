@@ -11,3 +11,4 @@ streamlit
 python-multipart
 requests
 psycopg[binary]
+pdfplumber
