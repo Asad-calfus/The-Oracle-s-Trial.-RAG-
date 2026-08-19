@@ -35,12 +35,14 @@ def build_rerank_prompt(question: str, chunks) -> str:
     return RERANK_PROMPT_TEMPLATE.format(question=question, passages=passages)
 
 
-def rerank_chunks(question: str, chunks):
+def rerank_chunks(question: str, chunks, top_k: int = RETRIEVAL_TOP_K):
     """Pick the chunks that actually help answer the question, best first.
 
-    Returns at most RETRIEVAL_TOP_K chunks, and possibly none — irrelevant
-    candidates are dropped rather than kept to pad the list, so they can't
-    end up cited as evidence for an answer they had no part in.
+    Returns at most top_k chunks (defaults to the config constant, but a
+    thread's own resolved setting — Section 21 — can override it), and
+    possibly none — irrelevant candidates are dropped rather than kept to
+    pad the list, so they can't end up cited as evidence for an answer
+    they had no part in.
 
     Falls back to the original (embedding-similarity) order if the LLM's
     reply can't be parsed into valid passage numbers — reranking should
@@ -79,7 +81,7 @@ def rerank_chunks(question: str, chunks):
             "falling back to embedding-similarity order",
             reply,
         )
-        return chunks[:RETRIEVAL_TOP_K]
+        return chunks[:top_k]
 
     logger.info("Reranker selected %d of %d candidates", len(ranked_chunks), len(chunks))
     return ranked_chunks[:RETRIEVAL_TOP_K]

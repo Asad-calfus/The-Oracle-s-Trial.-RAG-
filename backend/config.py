@@ -40,6 +40,10 @@ CHUNK_OVERLAP = 100
 # --- Models ---
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o-mini"
+# 0 so the same question with the same retrieved context makes the same
+# answer/decline decision every time (llm.py). Also surfaced in the "model
+# thinking" panel (Section 19.2) so a technical user can see what was used.
+LLM_TEMPERATURE = 0
 
 # --- Retrieval ---
 # How many chunks to pull back per question. Raised 4 -> 6 so the real

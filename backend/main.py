@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import shutil
@@ -5,7 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from backend.config import DOCUMENTS_DIR
@@ -13,11 +14,15 @@ from backend.database import (
     add_message,
     create_thread,
     get_messages,
+    get_thread_settings,
     init_db,
     list_threads,
+    reset_thread_settings,
+    update_thread_settings,
 )
 from backend.ingest import SUPPORTED_EXTENSIONS, ingest_document
-from backend.rag import generate_answer
+from backend.rag import generate_answer, generate_answer_stream
+from backend.settings import DEFAULT_SETTINGS
 from backend.vectorstore import list_documents
 
 logger = logging.getLogger(__name__)
@@ -68,6 +73,16 @@ class ThreadRequest(BaseModel):
     title: str
 
 
+class ThreadSettingsRequest(BaseModel):
+    """A PARTIAL update — every field is optional, and only the ones the
+    client actually sends get applied (Section 21.2's jsonb merge)."""
+    similarity_threshold: Optional[float] = None
+    retrieval_top_k: Optional[int] = None
+    rerank_candidate_k: Optional[int] = None
+    rewrite_history_messages: Optional[int] = None
+    llm_temperature: Optional[float] = None
+
+
 def safe_filename(filename: Optional[str]) -> str:
     """Reduce a client-supplied filename to a bare name, with no directory parts.
 
@@ -99,6 +114,29 @@ def safe_filename(filename: Optional[str]) -> str:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/config/defaults")
+async def config_defaults():
+    """The config-level default for each of the 5 tunable settings
+    (Section 21) — the frontend's single source of truth, instead of
+    hardcoding the same numbers a second time in a different process.
+    """
+    return DEFAULT_SETTINGS
+
+
+@app.patch("/threads/{thread_id}/settings")
+async def patch_thread_settings(thread_id: int, request: ThreadSettingsRequest):
+    partial = request.model_dump(exclude_none=True)
+    logger.debug("PATCH /threads/%s/settings %s", thread_id, partial)
+    return update_thread_settings(thread_id, partial)
+
+
+@app.delete("/threads/{thread_id}/settings")
+async def delete_thread_settings(thread_id: int):
+    """Clear every override for this thread — back to all 5 config defaults."""
+    logger.info("DELETE /threads/%s/settings (reset to defaults)", thread_id)
+    return reset_thread_settings(thread_id)
 
 
 @app.post("/upload")
@@ -168,12 +206,17 @@ async def query(request: QueryRequest):
     # answer exists, so the question being asked can't leak into its own
     # history.
     history = get_messages(request.thread_id) if request.thread_id else [] # for rewriter
+    # A thread's own overrides (Section 21) — {} for a thread that's never
+    # touched the settings panel, which resolve_settings() (inside
+    # generate_answer()) turns into the plain config defaults.
+    settings = get_thread_settings(request.thread_id) if request.thread_id else {}
 
     result = generate_answer(
         request.question,
         thread_id=request.thread_id,
         sources=request.sources,
         history=history,
+        settings=settings,
     )
 
     # Persisting is opt-in: a query without a thread_id still behaves exactly
@@ -181,7 +224,49 @@ async def query(request: QueryRequest):
     if request.thread_id is not None:
         add_message(request.thread_id, "user", request.question)
         add_message(
-            request.thread_id, "assistant", result["answer"], result["sources"]
+            request.thread_id, "assistant", result["answer"], result["sources"],
+            thinking=result.get("thinking"),
         )
 
     return result
+
+
+@app.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    """Same as /query, but the answer streams as it's generated.
+
+    Each line of the response body is one JSON object: {"type": "token",
+    "text": "..."} while the answer is being generated, then exactly one
+    {"type": "done", "answer", "sources", "rewritten_question"} once the
+    full answer (and therefore its citations) is known. Persisting to
+    Postgres happens after the stream ends, same as /query does before
+    returning — it just needs the complete answer text first.
+    """
+    logger.debug("POST /query/stream thread_id=%s", request.thread_id)
+
+    history = get_messages(request.thread_id) if request.thread_id else []
+    settings = get_thread_settings(request.thread_id) if request.thread_id else {}
+
+    def event_stream():
+        final = None
+        for kind, payload in generate_answer_stream(
+            request.question,
+            thread_id=request.thread_id,
+            sources=request.sources,
+            history=history,
+            settings=settings,
+        ):
+            if kind == "token":
+                yield json.dumps({"type": "token", "text": payload}) + "\n"
+            else:
+                final = payload
+                yield json.dumps({"type": "done", **payload}) + "\n"
+
+        if request.thread_id is not None and final is not None:
+            add_message(request.thread_id, "user", request.question)
+            add_message(
+                request.thread_id, "assistant", final["answer"], final["sources"],
+                thinking=final.get("thinking"),
+            )
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")

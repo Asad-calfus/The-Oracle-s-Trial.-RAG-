@@ -1,3 +1,5 @@
+import json
+
 import requests
 import streamlit as st
 
@@ -32,6 +34,59 @@ def render_sources(sources):
         excerpt = source.get("excerpt")
         if excerpt:
             st.caption(f"   _\"{excerpt}\"_")
+
+
+def render_thinking(thinking, key):
+    """Collapsed-by-default panel showing the pipeline's own real numbers —
+    not a separate LLM-generated explanation (PLANNING.md 19.2). Nothing
+    here is shown unless the user opens it.
+    """
+    if not thinking:
+        return
+    with st.expander("🧠 Show thinking", expanded=False):
+        if thinking.get("rewritten_question"):
+            st.caption(f"Rewritten question: _{thinking['rewritten_question']}_")
+
+        source_filter = thinking.get("source_filter") or {}
+        filter_bits = [f"thread_id={source_filter.get('thread_id')}"]
+        if source_filter.get("filenames"):
+            filter_bits.append(f"filenames={source_filter['filenames']}")
+        st.caption(f"Search scope: {', '.join(filter_bits)}")
+
+        # All 5 tunable knobs (Section 21) actually used for THIS answer —
+        # config defaults unless this thread has its own overrides.
+        settings_used = thinking.get("settings_used") or {}
+        st.caption(
+            f"Retrieved {thinking.get('retrieved_count', 0)} candidate chunk(s) — "
+            f"similarity threshold: {settings_used.get('similarity_threshold')} "
+            "(lower score = more similar)"
+        )
+
+        # Per-chunk breakdown: exactly which chunks were involved and what
+        # happened to each, not just aggregate counts.
+        breakdown = thinking.get("chunk_breakdown") or []
+        if breakdown:
+            st.dataframe(breakdown, use_container_width=True, hide_index=True, key=f"{key}-breakdown")
+
+        st.caption(
+            f"{thinking.get('passed_threshold_count', 0)} passed the threshold, "
+            f"{thinking.get('kept_after_rerank_count', 0)} kept after reranking "
+            f"(retrieval_top_k={settings_used.get('retrieval_top_k')}, "
+            f"rerank_candidate_k={settings_used.get('rerank_candidate_k')})"
+        )
+
+        st.caption(
+            f"Model: {thinking.get('model')} "
+            f"(temperature={settings_used.get('llm_temperature')}, "
+            f"rewrite_history_messages={settings_used.get('rewrite_history_messages')})"
+        )
+
+        usage = thinking.get("token_usage")
+        if usage:
+            st.caption(
+                f"Token usage — input: {usage.get('input_tokens')}, "
+                f"output: {usage.get('output_tokens')}, total: {usage.get('total_tokens')}"
+            )
 
 
 def fetch(path):
@@ -156,6 +211,85 @@ with st.sidebar:
                 placeholder="All documents",
             )
 
+    # Settings are per-thread (Section 21), so there's nothing to show or
+    # save until a thread actually exists.
+    if active_thread_id is not None:
+        defaults = fetch("/config/defaults") or {}
+        current_thread = next(
+            (t for t in fetch("/threads") or [] if t["id"] == active_thread_id), None
+        )
+        thread_overrides = (current_thread or {}).get("settings") or {}
+        resolved = {**defaults, **thread_overrides}
+
+        def sync_setting(key, new_value):
+            """Persist immediately (PATCH sends just this one key) only
+            when the slider actually moved — every OTHER widget interaction
+            on the page also reruns this script, and on those reruns the
+            slider simply returns its already-stored value, so this stays
+            a no-op the rest of the time."""
+            if new_value != resolved.get(key):
+                requests.patch(
+                    f"{API_BASE_URL}/threads/{active_thread_id}/settings",
+                    json={key: new_value},
+                )
+                st.rerun()
+
+        with st.expander("⚙️ Advanced settings"):
+            similarity_threshold = st.slider(
+                "Similarity threshold",
+                min_value=0.5, max_value=3.0, step=0.1,
+                value=float(resolved.get("similarity_threshold", 1.8)),
+                help="Lower = stricter (only very close matches count, more "
+                "'I don't know'). Higher = looser (more chunks reach the AI).",
+            )
+            sync_setting("similarity_threshold", similarity_threshold)
+
+            retrieval_top_k = st.slider(
+                "Sources to consider (after reranking)",
+                min_value=1, max_value=20, step=1,
+                value=int(resolved.get("retrieval_top_k", 6)),
+                help="How many chunks reach the final answer. More = more "
+                "context but more tokens/cost.",
+            )
+            sync_setting("retrieval_top_k", retrieval_top_k)
+
+            rerank_candidate_k = st.slider(
+                "Initial candidate pool (before reranking)",
+                min_value=5, max_value=30, step=1,
+                value=int(resolved.get("rerank_candidate_k", 15)),
+                help="How wide the initial search is before narrowing down. "
+                "Higher = less likely to miss something relevant, slightly slower.",
+            )
+            sync_setting("rerank_candidate_k", rerank_candidate_k)
+
+            rewrite_history_messages = st.slider(
+                "Conversation memory depth",
+                min_value=0, max_value=20, step=1,
+                value=int(resolved.get("rewrite_history_messages", 6)),
+                help="How many past messages are used to resolve follow-up "
+                "questions ('his role?' etc). 0 turns conversational memory off.",
+            )
+            sync_setting("rewrite_history_messages", rewrite_history_messages)
+
+            llm_temperature = st.slider(
+                "Answer creativity (temperature)",
+                min_value=0.0, max_value=1.0, step=0.1,
+                value=float(resolved.get("llm_temperature", 0)),
+                help="0 is the safest default for fact-grounded answers — "
+                "raising this trades consistency for varied phrasing.",
+            )
+            sync_setting("llm_temperature", llm_temperature)
+            if llm_temperature > 0:
+                st.caption(
+                    "⚠️ Non-zero temperature means the same question can get "
+                    "differently-worded answers on different runs."
+                )
+
+            st.divider()
+            if thread_overrides and st.button("↩️ Reset to defaults", use_container_width=True):
+                requests.delete(f"{API_BASE_URL}/threads/{active_thread_id}/settings")
+                st.rerun()
+
 # Read again here: the sidebar above may have just created a thread via an
 # upload, and the chat area below needs that fresh value, not a stale one
 # read before the sidebar ran.
@@ -165,11 +299,12 @@ active_thread_id = st.session_state.active_thread_id
 # script renders right now, so past messages have to be drawn explicitly
 # rather than staying on screen by themselves.
 if active_thread_id is not None:
-    for message in fetch(f"/threads/{active_thread_id}/messages") or []:
+    for index, message in enumerate(fetch(f"/threads/{active_thread_id}/messages") or []):
         with st.chat_message(message["role"]):
             st.write(message["content"])
             if message["role"] == "assistant":
                 render_sources(message["sources"] or [])
+                render_thinking(message.get("thinking"), key=f"thinking-{index}")
 
 # chat_input pins itself to the bottom of the page and returns the submitted
 # text once, then None on the reruns that follow.
@@ -184,19 +319,45 @@ if question:
         st.write(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            response = requests.post(
-                f"{API_BASE_URL}/query",
+        placeholder = st.empty()
+        answer_so_far = ""
+        final_payload = None
+
+        try:
+            with requests.post(
+                f"{API_BASE_URL}/query/stream",
                 json={
                     "question": question,
                     "sources": selected_sources,
                     "thread_id": active_thread_id,
                 },
-            )
+                stream=True,
+            ) as response:
+                if response.ok:
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        event = json.loads(line)
+                        if event["type"] == "token":
+                            answer_so_far += event["text"]
+                            # A blinking cursor while tokens are still arriving,
+                            # so a mid-sentence render doesn't look "finished".
+                            placeholder.write(answer_so_far + " ▌")
+                        else:
+                            final_payload = event
 
-        if response.ok:
-            # The backend already saved both messages, so rerun and let the
-            # replay loop above read them back — no second copy kept here.
-            st.rerun()
-        else:
-            st.error(f"Query failed: {response.text}")
+                    if final_payload is not None:
+                        placeholder.write(final_payload["answer"])
+                        render_sources(final_payload.get("sources") or [])
+                        render_thinking(final_payload.get("thinking"), key="thinking-live")
+                else:
+                    st.error(f"Query failed: {response.text}")
+        except requests.RequestException as e:
+            st.error(f"Backend not reachable: {e}")
+
+    # Both messages are already saved by the backend by the time the stream
+    # ends — rerun so the sidebar/thread list stay in sync (e.g. a brand new
+    # chat's title now exists), without keeping a second copy of the answer
+    # here.
+    if final_payload is not None:
+        st.rerun()
