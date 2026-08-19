@@ -1335,8 +1335,7 @@ STEP O5   Real test files used instead of a purpose-built one:
 
 STEP O6   End-to-end UI test: upload with the checkbox checked, ask a
           question whose answer only exists in an image/chart, confirm a
-          real answer with a correct filename+page citation. IN PROGRESS
-          — do this next.
+          real answer with a correct filename+page citation. DONE.
 ```
 
 ### 15.6 What Does NOT Change
@@ -1362,3 +1361,785 @@ extraction, from OCR, or from an appended image description.
 - **The detection heuristic is approximate**, not a guarantee — but a false
   positive (running OCR on a page that didn't need it) is harmless, just a
   wasted LLM call.
+
+---
+
+## 16. Paragraph Citations, Table Extraction, Streaming Answers — Implementation Plan
+
+Three independent features, tackled in increasing order of complexity.
+None of them touch each other's code, so they can be built and tested
+one at a time without conflicts.
+
+### 16.1 Paragraph-Level Citations
+
+**Problem today**: a citation is only `{filename, page}` — accurate but
+coarse. A page can be long; the user still has to scan the whole page to
+find the actual sentence that answered their question.
+
+**Two-tier approach**, cheapest first:
+
+- **Tier 1 (recommended starting point) — quote the exact chunk text.**
+  Every chunk retrieved for an answer already IS a small, specific span of
+  the page (~700 characters, roughly a paragraph, because of
+  `CHUNK_SIZE`). The chunk's own text is already sitting in memory at
+  answer time — nothing needs to be computed or stored newly. Just include
+  a short excerpt (e.g. first ~150 characters) of the chunk alongside
+  `{filename, page}` in the citation. This turns "Page 4" into "Page 4 —
+  '...average tenure across departments was...'" — the user can
+  `Ctrl+F` straight to it. No new dependency, no ingestion change, no
+  pipeline risk.
+
+- **Tier 2 (optional stretch) — real paragraph numbers.** Requires
+  detecting paragraph boundaries at ingestion time (e.g. via `pdfplumber`
+  line-gap analysis: a bigger-than-normal vertical gap between lines marks
+  a new paragraph), assigning each detected paragraph an index, and
+  carrying that index through to whichever chunk(s) it ends up in as
+  `paragraph_number` metadata. More accurate ("Page 4, Paragraph 2") but a
+  real ingestion change with its own edge cases (paragraphs split across
+  chunks, multi-column layouts confusing line-gap detection).
+
+```text
+STEP C1   backend/rag.py — extend get_sources() (or wherever citation
+          dicts are built) to include a short excerpt from each cited
+          chunk's page_content, alongside filename/page. DONE
+          (build_excerpt(), EXCERPT_LENGTH=150, collapses whitespace,
+          truncates with "...").
+
+STEP C2   frontend/app.py — render_sources(): show the excerpt under each
+          citation, e.g. as a smaller/italic caption line. DONE.
+
+STEP C3   Test: ask a question, confirm the excerpt shown actually
+          contains language relevant to the answer (spot-check a few).
+          NEXT — do this in the running app.
+
+--- Tier 2, only if C1-C3 feels insufficient ---
+
+STEP C4   backend/ocr.py or a new backend/paragraphs.py — a
+          split_into_paragraphs(file_path, page_number) helper using
+          pdfplumber's line/word position data.
+
+STEP C5   Wire into load_pdf()/split_documents() so each chunk inherits a
+          paragraph_number in its metadata.
+
+STEP C6   Update citations to show "Page X, Paragraph Y" when available.
+```
+
+**Recommendation**: build Tier 1 only for now — it solves the actual pain
+(finding the answer on the page) with almost no engineering risk. Revisit
+Tier 2 only if excerpts alone prove insufficient in practice.
+
+### 16.2 Table Extraction
+
+**Problem today**: `PyPDFLoader`'s flat text extraction reads a table
+column-by-column or row-by-row in a jumbled order that loses the
+row/column structure — a question like "what was Q3 revenue in the North
+region?" becomes hard for the LLM to answer correctly even if the raw
+table text is technically present in the chunk.
+
+**Approach** — deliberately mirrors the OCR/image work already built
+(Section 15), reusing the same architectural pattern and the same
+`pdfplumber` dependency already in the project:
+
+```text
+For each page:
+  → pdfplumber's page.extract_tables() detects any tables on the page
+  → each detected table (a list of rows) is converted into a clean
+    Markdown table (e.g. using "| a | b |" syntax) — Markdown tables are
+    easy for an LLM to read correctly and cheap to generate, no vision
+    LLM call needed (this is a structural extraction, not OCR)
+  → the Markdown version is APPENDED to the page's existing text, labeled
+    similarly to the image feature (e.g. "[Table content]\n<markdown>"),
+    so the clean structured version is available for retrieval alongside
+    whatever PyPDFLoader already extracted
+```
+
+No vision LLM cost here — `extract_tables()` is a pure parsing operation,
+so this feature can safely run automatically on every upload rather than
+needing an opt-in checkbox like image description does.
+
+```text
+STEP T1   backend/tables.py — extract_tables_as_markdown(file_path,
+          page_number) -> list[str]: use pdfplumber's extract_tables(),
+          convert each table's rows into a Markdown table string. DONE.
+
+STEP T2   Wire into load_pdf(): for each page, if extract_tables_as_markdown
+          returns anything, append it under the page's existing text
+          (same append pattern as the image feature). Log how many tables
+          were found per page. Runs unconditionally (not opt-in) since
+          it's pure parsing, no LLM cost. DONE.
+
+STEP T3   Test standalone against a real PDF containing a table — confirm
+          the Markdown table reads correctly and preserves rows/columns.
+          DONE (table_rag_test.pdf).
+
+STEP T4   End-to-end test: upload a document with a table, ask a question
+          whose answer requires reading a specific row/column, confirm
+          the answer is correct (not just "present somewhere"). DONE.
+```
+
+**Complexity**: Low — same append pattern as Section 15, no new paid
+dependency, no opt-in UI needed since it's free to run.
+
+### 16.3 Streaming Answers
+
+**Problem today**: `/query` waits for the entire answer to be generated
+before responding — the user stares at a spinner for the full duration of
+retrieval + reranking + the LLM's full response generation.
+
+**Why this one is the most involved**: unlike the other two, this changes
+the shape of an existing endpoint, not just what happens during ingestion.
+Two things currently depend on having the COMPLETE answer text before
+anything else can happen:
+- `is_no_answer()` decides whether to show citations, and it needs the
+  full answer text to check.
+- `add_message()` persists the complete answer to Postgres.
+
+**Approach**: retrieval, reranking, and question-rewriting still happen
+up front exactly as today (they're fast and don't need streaming) — only
+the FINAL answer-generation LLM call streams token-by-token. The backend
+accumulates the full text as it streams past, and only after the stream
+ends does it run `is_no_answer()` and persist the message — the same
+logic as today, just deferred to the end of the stream instead of before
+the response starts.
+
+```text
+STEP S1   backend/rag.py — add a streaming variant, e.g.
+          generate_answer_stream(), that does the same retrieval/rerank/
+          rewrite steps as generate_answer() but calls llm.stream(prompt)
+          instead of llm.invoke(prompt), yielding each token as it
+          arrives. DONE — yields ("token", text) then one final
+          ("done", {answer, sources, rewritten_question}).
+
+STEP S2   backend/main.py — new endpoint, e.g. POST /query/stream, using
+          FastAPI's StreamingResponse: yields answer tokens as they're
+          generated, then (after the stream ends) figures out
+          is_no_answer()/sources and persists both messages via
+          add_message() — same as /query does today, just after the loop
+          instead of before returning. DONE — newline-delimited JSON
+          (application/x-ndjson) response body.
+
+STEP S3   frontend/app.py — replace the blocking requests.post() call for
+          questions with a streamed request (requests.post(..., stream=
+          True) or Streamlit's st.write_stream), updating the answer
+          text incrementally as chunks arrive. Sources are rendered only
+          once the stream finishes (mirrors backend timing). DONE.
+
+STEP S4   Test: ask a question, confirm the answer visibly streams in
+          instead of appearing all at once; confirm "I don't know"
+          questions still correctly show zero citations; confirm the
+          full exchange is still saved to Postgres and reappears
+          correctly on a thread reload.
+```
+
+**Complexity**: Medium-High — the only one of the three that changes an
+existing request/response shape rather than purely adding to ingestion.
+Recommend building this last, after paragraph citations and table
+extraction are done and stable.
+
+### 16.4 Suggested Build Order
+
+1. **Paragraph citations (Tier 1)** — smallest change, immediate value,
+   almost no risk.
+2. **Table extraction** — reuses the exact append pattern already proven
+   in Section 15, free to run, moderate value for table-heavy documents.
+3. **Streaming answers** — biggest UX win but the only one requiring a
+   real endpoint/response-shape change; do it last once the simpler wins
+   are banked.
+
+---
+
+## 17. Knowledge-Graph Retrieval Experiment — `cognee`
+
+**This is explicitly an experiment/comparison, not a decided architecture
+change.** The goal is to find out whether graph-based retrieval actually
+helps on this project's real documents, before touching the production
+pipeline at all.
+
+### 17.1 What `cognee` Is and Why It's Worth Testing
+
+`cognee` (open-source, `pip install cognee`) is a library that builds a
+**knowledge graph** from documents: it runs each document through an LLM
+to extract entities (people, orgs, dates, concepts) and the relationships
+between them, then stores that graph so a question can be answered by
+**traversing relationships**, not just by finding the single closest text
+chunk.
+
+Where this could help: today's pipeline (Chroma + vector similarity) treats
+every chunk independently — it's strong at "find the paragraph that talks
+about X" but weaker at multi-hop, relationship-style questions like *"which
+policy references the certification reimbursement policy?"* or *"who is
+mentioned in both the resume and the referral policy?"* — questions where
+the answer isn't sitting in one chunk, it's a connection between two.
+
+Where it likely won't help (worth being honest about going in): this
+project's actual documents so far — policies, a resume, an ISO standard,
+health statistics — are mostly fact-lookup documents, not
+relationship-dense ones. The value of this experiment is finding out
+whether that's really true, not assuming the answer either way.
+
+### 17.2 How It Works, Architecturally
+
+```text
+cognee.add(document_text)      # ingest — no LLM call yet
+cognee.cognify()               # THE EXPENSIVE STEP — LLM calls extract
+                                # entities/relationships and build the graph
+cognee.search(query, search_type=...)   # query the graph, cheap per call
+```
+
+- **Vector store**: LanceDB, embedded locally by default (a second vector
+  store alongside the project's existing Chroma — not a replacement, a
+  parallel system for this experiment).
+- **Graph store**: NetworkX, also embedded locally by default — no Neo4j
+  or other separate service required to get started.
+- **LLM**: reuses the same `OPENAI_API_KEY` already configured for this
+  project (`cognee` reads it from its own `LLM_API_KEY` env var).
+- Search types include `GRAPH_COMPLETION` (natural-language answer using
+  graph context), `RAG_COMPLETION` (closer to what this project already
+  does), and `CHUNKS` (plain semantic chunk search) — worth trying more
+  than one during the comparison.
+
+### 17.3 The Real Concern: Citations
+
+This project's single strongest safety property (Rule 16, and the whole
+reason `get_sources()` exists) is that **every citation comes from
+metadata attached at ingestion, never from the LLM** — so a citation can
+never be wrong or invented. `cognee`'s `search()` returns an
+LLM-synthesized answer from graph traversal; it does not naturally carry
+the same "exact filename + page, guaranteed non-hallucinated" citation
+guarantee this project has built everywhere else. **This has to be
+checked directly in the experiment** — if `cognee`'s output can't be
+traced back to a specific source with the same confidence, that's a real
+regression, not just a UX detail, for a project whose stated goal is
+grounded, citable answers.
+
+### 17.4 Step-by-Step Experiment Plan
+
+```text
+STEP E1   pip install cognee. Set LLM_API_KEY (same value as
+          OPENAI_API_KEY) in a scratch script — do NOT touch backend/
+          config.py or any existing module yet. Feed the text of ONE
+          existing test document through cognee.add() + cognee.cognify()
+          in a standalone script. Time it and log how many LLM calls /
+          roughly what it costs — cognify() is proportional to
+          entity/relationship density, not just page count, so this
+          number matters before testing at any scale.
+
+STEP E2   Same standalone script — run cognee.search() with a
+          relationship-style question (one that genuinely needs two
+          documents/entities connected, not a plain fact lookup) using
+          GRAPH_COMPLETION, then again using RAG_COMPLETION. Compare
+          both answers to what the existing /query pipeline gives for
+          the same question.
+
+STEP E3   Repeat E2 for 4-5 questions total: a mix of plain fact-lookup
+          questions (where the current pipeline already does well) and
+          relationship-style questions (where it might not). For each,
+          record: answer correctness, whether a traceable citation
+          exists, and latency. This produces a real side-by-side table,
+          not a guess.
+
+STEP E4   Decision point based on E1-E3's actual numbers — not before:
+            - If graph retrieval doesn't measurably beat the current
+              pipeline on this project's real documents, stop here
+              and document the finding (a real "we tried it and it
+              didn't help enough to justify the complexity" result is
+              still a useful, honest outcome).
+            - If it does help on a specific question type, the next
+              question is HOW to integrate: a separate opt-in
+              "deep search" mode alongside the existing /query, not a
+              replacement — the citation-integrity gap in 17.3 would
+              need a real solution first, not a shortcut.
+```
+
+### 17.5 Caveats Worth Knowing Going In
+
+- **`cognify()` is slow and costs multiple LLM calls per document** —
+  budget real time and real API cost for E1 before running it on more
+  than one document.
+- **Two new embedded databases** (LanceDB + a NetworkX-backed graph
+  store) would sit alongside the existing Chroma store if this ever went
+  beyond the experiment stage — genuine added operational complexity.
+- **Citation integrity (17.3) is the single biggest open question** —
+  everything else in this project was built around "never let the LLM
+  invent a source"; this experiment is the first time that guarantee is
+  even in question, so it needs a direct answer, not an assumption.
+
+### 17.6 Experiment Findings (E1-E3)
+
+- **cognify() is genuinely expensive even on a small document**: a single
+  Wikibooks-chapter-sized PDF took **109.9 seconds** and produced 56 raw
+  nodes / 115 edges (consolidated to 14 entities / 15 relationships) — a
+  double-digit number of LLM calls for a small document. Cost/time scales
+  with content, so a large document (e.g. the 494k-character
+  `worldhealthstatistics_2022.pdf`) would be substantially more expensive
+  — this was deliberately NOT tested at that scale given E1's result.
+- **Answer quality was solid** on a relationship-style question — both
+  `GRAPH_COMPLETION` and `RAG_COMPLETION` gave accurate, coherent answers.
+  No clear graph-specific advantage showed up on this single-document
+  test, though the question wasn't genuinely multi-document/multi-hop.
+- **Citation traceability — confirmed gap**: neither `GRAPH_COMPLETION`
+  nor `RAG_COMPLETION` returns anything beyond a dataset-level identifier
+  (no filename, no page). `CHUNKS` does return the actual matched raw
+  text plus a `document_name`/`chunk_index`, but `document_name` was a
+  generated hash (because the experiment fed extracted text, not the
+  original file) and there is no page number in any mode. **Conclusion**:
+  `cognee` cannot meet this project's citation-integrity bar (Rule 16) as
+  a primary answer source.
+- **Decision (per the user)**: do not pursue `cognee` as an answer/
+  citation source at all — that requirement doesn't apply here. Instead,
+  reuse the one genuinely good part of this experiment — cognee's
+  built-in `visualize_graph()` — as a **pure visualization feature**: an
+  optional panel showing a document's extracted entities/relationships as
+  an interactive graph. See Section 18 for the implementation plan, which
+  treats the cost finding above as a hard design constraint.
+
+---
+
+## 18. Knowledge Graph Visualization Panel — Implementation Plan
+
+**Scope, explicitly**: this is a visualization side-feature only. It does
+NOT touch retrieval, answers, or citations — `cognee` is disqualified from
+that role by Section 17.6's finding. This panel exists purely so a user
+can visually explore a document's extracted entities/relationships,
+completely separate from asking it questions.
+
+**Every design decision below exists to control cost**, given Section
+17.6's measured finding (~110 seconds and dozens of LLM calls for even a
+SMALL document):
+
+1. **Strictly opt-in, per document, on demand** — never automatic on
+   upload (unlike table extraction) and not even automatic alongside the
+   existing `include_images` checkbox. A separate "Generate knowledge
+   graph" button per document, clicked only when a user actually wants
+   to see one.
+2. **Generate once, cache forever** — the generated HTML is saved to disk
+   (`data/graphs/{thread_id}/{filename}.html`). If that file already
+   exists, clicking the button again just re-opens it — `cognify()`
+   never re-runs for a document that already has one, unless the user
+   explicitly asks to regenerate.
+3. **A hard size cap with a clear message** — documents above a
+   configurable character limit (e.g. `GRAPH_MAX_CHARS`) are refused with
+   an explanation ("too large for graph visualization — costs scale with
+   content"), rather than silently running an expensive job. This
+   directly prevents the "494k-character document" scenario from ever
+   reaching `cognify()` un-warned.
+4. **An explicit cost/time warning in the UI** before the button is even
+   clickable — the same pattern as the `include_images` checkbox's help
+   text, but more prominent given the larger cost/time (minutes, not
+   seconds).
+5. **Isolated per document** — each document gets its own `cognee`
+   dataset (`dataset_name` scoped to `thread_id` + filename), so
+   different documents' graphs never mix, and re-processing one document
+   never touches another's already-built graph.
+
+### 18.1 Step-by-Step Build Plan
+
+```text
+STEP G1   backend/knowledge_graph.py — dataset_name_for(thread_id,
+          filename) and graph_output_path(thread_id, filename) helpers
+          (mirrors the per-thread folder pattern already used for
+          uploads). Verify, with two small test documents, that scoping
+          cognee.add()/cognify() by dataset_name actually keeps their
+          graphs separate — this is the one piece of cognee's behavior
+          not yet directly confirmed in this project's testing, so
+          confirm it before building on top of it.
+
+STEP G2   backend/knowledge_graph.py — build_graph(file_path, thread_id,
+          filename) -> str (output path):
+            - refuse (raise/return an error) if the document's extracted
+              text exceeds GRAPH_MAX_CHARS
+            - if graph_output_path() already exists, return it immediately
+              — no re-run
+            - otherwise: cognee.add(text, dataset_name=...),
+              cognee.cognify(datasets=[dataset_name]),
+              visualize_graph(output_path), return output_path
+          Log start/end and elapsed time (this is exactly the kind of
+          activity Section 14's logging work was built to capture).
+
+STEP G3   backend/config.py — add GRAPH_MAX_CHARS (start conservative,
+          e.g. 20,000-50,000 — small enough that a full run stays in the
+          tens-of-seconds range based on the E1 timing data, not minutes).
+
+STEP G4   backend/main.py — new endpoint, e.g. POST
+          /documents/{filename}/graph?thread_id=..., calling build_graph()
+          and returning the output path (or the HTML content directly).
+
+STEP G5   frontend/app.py — in the "Documents in use" section, a
+          "Generate knowledge graph" button per document, with cost/time
+          warning text alongside it (mirroring the include_images
+          checkbox's help text). On click, calls the endpoint and embeds
+          the returned HTML inline via
+          st.components.v1.html(html_content, height=600) — no separate
+          file needs to be served or opened manually.
+
+STEP G6   End-to-end test: click the button on a real (small) document,
+          confirm the graph renders inline in the app; click it again and
+          confirm it does NOT re-run cognify() (near-instant the second
+          time); try a document over GRAPH_MAX_CHARS and confirm it's
+          refused with a clear message instead of silently running.
+```
+
+### 18.2 What Does NOT Change
+
+Nothing about `/query`, `/query/stream`, retrieval, reranking, or
+citations changes. This is an entirely additive, opt-in panel — a user
+who never clicks "Generate knowledge graph" sees zero difference and
+incurs zero extra cost, exactly like `include_images`.
+
+---
+
+## 19. PII Redaction + "Model Thinking" Panel — Implementation Plan
+
+Two independent features, motivated by the same real-world trigger: the
+project is now being used with actual company-private documents, not just
+test PDFs. Neither touches the other's code.
+
+### 19.1 PII Redaction at Ingestion
+
+**Decision (per the user): redact at ingestion, permanently** — PII is
+detected and masked in a page's text BEFORE it's chunked or embedded, so
+it is structurally incapable of appearing in a chunk, an embedding, an
+answer, or a citation excerpt. This is stronger than masking only at
+display time (which would still let PII sit in the vector store and pass
+through the LLM's context on every query) — the tradeoff is that it's a
+one-way door: once redacted at upload, the original value is gone from
+what the system can retrieve or answer with.
+
+**The real tension to be upfront about**: this project's own test
+history includes a legitimate use case built around a PERSON'S name and
+role — *"What was Ajinkya's role at Airports Authority of India?"*
+(`RERANKING_EXPERIMENT.md`). If redaction is too aggressive (e.g., it
+masks every proper name), that exact kind of resume/profile lookup stops
+working — which is core functionality, not an edge case, for a
+document-Q&A tool. So redaction has to target things that are almost
+NEVER the actual answer to a legitimate business question, not anything
+that looks personally identifiable.
+
+**Two-tier approach**, cheapest and least risky first:
+
+- **Tier 1 — regex-based, structured PII only.** Emails, phone numbers,
+  national ID numbers (PAN/Aadhaar-style patterns, given this project's
+  documents are India-based — INR salary figures, Indian phone formats),
+  and credit-card-like numbers. These are near-universally NOT what a
+  legitimate question is asking about, they're a side effect of a
+  document mentioning a contact method or an ID number. Pure regex — no
+  LLM call, no new dependency, runs automatically on every upload (same
+  category as table extraction: free, so no opt-in needed).
+- **Tier 2 (optional stretch, NOT built now unless asked) — free-text
+  entities (names, addresses).** This needs either an NER
+  library/model or an LLM pass, costs more, and is exactly where the
+  "Ajinkya" tension above becomes real — would need per-document opt-in,
+  clearly separate from Tier 1, and probably a way to say "except this
+  document" for legitimate profile/resume lookups. Left as a stretch,
+  not part of this build.
+
+```text
+STEP PII1   backend/pii.py — PII_PATTERNS: compiled regexes for email,
+            phone (Indian + generic international formats), PAN-style
+            (AAAAA9999A), Aadhaar-style (12 digits, optionally spaced),
+            credit-card-like (13-16 digits). redact_text(text) -> (str,
+            int): replace each match with a labeled placeholder (e.g.
+            "[REDACTED_EMAIL]"), return the redacted text and a count of
+            replacements made.
+
+STEP PII2   Wire into load_pdf() (backend/ingest.py): run redact_text()
+            on each page's FINAL text — AFTER the table/image steps have
+            already appended their content, so nothing they add escapes
+            redaction, and before chunking/before the function returns
+            (must run on every path, including when include_images is
+            False — an early return before this point would skip it).
+            Runs unconditionally, like table extraction. Log how many
+            redactions happened per page (fits Section 14's logging
+            work) — this is also how a real leak would first get
+            noticed, so this log line matters. DONE.
+
+STEP PII3   Test standalone: feed redact_text() a string with a known
+            email/phone/PAN-style number, confirm each is replaced and
+            the rest of the text is untouched.
+
+STEP PII4   End-to-end test: upload a document containing a fake-but-
+            realistic email/phone number, confirm it never appears in an
+            answer or a citation excerpt; then upload the existing
+            resume test document and confirm a legitimate name/role
+            question (the Ajinkya-style question) still works exactly as
+            before — this is the regression check that actually matters.
+```
+
+**What does NOT change**: chunking, embedding, retrieval, reranking, and
+citations are all untouched — redaction happens once, to the page text,
+before any of them run. A chunk that was redacted just has different
+text; nothing downstream needs to know why.
+
+### 19.2 "Model Thinking" Panel (Pipeline Transparency)
+
+**Decision (per the user): show the pipeline's own real steps, not a
+separate LLM-generated explanation.** Every piece of this is already
+computed by `generate_answer()`/`generate_answer_stream()` today and
+currently thrown away after the request — rewritten question, how many
+candidates were retrieved, their similarity scores, how many survived the
+score threshold, how many the reranker kept. Surfacing it costs nothing
+extra: no new LLM call, no new latency, just returning data that already
+exists.
+
+**Not default, collapsible** — a `st.expander("🧠 Show thinking",
+expanded=False)` under each assistant message, per the user's own
+instruction. A user who never opens it sees no change at all.
+
+```text
+STEP MT1   backend/rag.py — extend generate_answer()'s and
+            generate_answer_stream()'s return dict with a "thinking" key:
+            {"rewritten_question", "retrieved_count", "retrieved_scores"
+            (rounded), "passed_threshold_count", "kept_after_rerank_count"}.
+            Populate it at each stage of the existing pipeline (no new
+            computation — these numbers already exist mid-function today,
+            just not returned). DONE — build_thinking() helper, called at
+            all three return points in each function.
+
+STEP MT2   backend/main.py — /query and /query/stream both already return
+            the full result dict / the "done" event — just make sure
+            "thinking" rides along unchanged. DONE — confirmed no code
+            change was needed beyond MT1.
+
+STEP MT3   backend/database.py / add_message() — persist "thinking"
+            alongside a message (same pattern as `sources`), so it's
+            still visible after a thread reload. DONE — new `thinking`
+            JSONB column (migration-safe `ALTER TABLE ADD COLUMN IF NOT
+            EXISTS`, since `messages` already existed in earlier
+            deployments), `add_message()`/`get_messages()` updated, both
+            endpoints pass `result.get("thinking")` through.
+
+STEP MT4   frontend/app.py — render_thinking(): an expander showing the
+            rewritten question (only if it differs from the original),
+            retrieved candidate count + similarity scores, how many
+            passed the threshold, how many the reranker kept. DONE —
+            called after render_sources() in both the thread-replay loop
+            and the live-streaming block.
+
+STEP MT5   End-to-end test: ask a follow-up question (so the rewritten
+            question actually differs), confirm the expander shows it
+            plus retrieval scores; confirm it's collapsed by default and
+            the answer/citations look exactly as before when it's left
+            closed.
+```
+
+**What does NOT change**: the answer itself, retrieval, reranking, and
+citations are all identical to today — this only adds a way to SEE
+numbers that were already being computed, nothing about how they're
+computed changes.
+
+### 19.3 Suggested Build Order
+
+1. **PII redaction (Tier 1)** — higher stakes (real company documents),
+   should land first.
+2. **Model thinking panel** — purely additive UI/transparency feature,
+   no urgency tied to it, safe to do second.
+
+---
+
+## 20. Multi-Format Document Support (.docx, .txt, .md) — Implementation Plan
+
+### 20.1 Tech Choice: Lightweight Per-Format Loaders, Not Docling
+
+**Decision (per the user, after checking Docling's actual footprint):
+lightweight, format-specific loaders — no Docling.** Docling ships with
+PyTorch bundled in its own wheel and, for PDFs specifically, downloads its
+own layout-detection model weights on first run. That's a large
+dependency footprint whose main value (excellent unified PDF/table/layout
+parsing) this project doesn't need — the PDF pipeline is already built
+and working (`PyPDFLoader` + `pdfplumber` tables + the custom vision-LLM
+OCR). Pulling in Docling just to also read `.docx`/`.txt`/`.md` would mean
+a multi-hundred-MB install for formats that are structurally simple.
+
+Instead:
+- **`.txt` / `.md`** — read as plain text with Python's built-in `open()`.
+  No library at all.
+- **`.docx`** — `python-docx`, a small, pure-Python library that parses
+  the format's XML directly. No ML models, no heavy dependency.
+- **`.pdf`** — completely unchanged. The existing `load_pdf()` pipeline
+  (PyPDFLoader, table extraction, opt-in image description, PII
+  redaction) is untouched.
+
+### 20.2 The "No Pages" Problem
+
+`.txt`/`.md` have no page concept at all, and `.docx` pagination is a
+*rendering-time* concern (how Word lays it out on screen/print) — it is
+NOT stored data in the file the way a PDF's page boundaries are. So a
+citation for these formats can only ever be `{filename}`, never
+`{filename}, Page N}`.
+
+`get_sources()` already tolerates this gracefully today: `page_display`
+is `None` whenever `metadata["page"]` isn't an int. The one real fix
+needed is on the frontend — `render_sources()` currently always prints
+`"— Page {page}"`, which would literally show `"— Page None"`. That needs
+to become conditional: show the page segment only when a page actually
+exists.
+
+### 20.3 What Does NOT Extend to New Formats (This Build)
+
+- **Table extraction** (Section 16.2) and **image description/OCR**
+  (Section 15) stay PDF-only for now — both are built around
+  `pdfplumber`'s page-level PDF-specific API. `.docx` CAN contain tables/
+  images too, but that's a real stretch goal, not part of this build.
+- **PII redaction** (Section 19.1), by contrast, SHOULD apply to every
+  format equally — it's pure regex over whatever final text a document
+  produces, format-agnostic by nature. This build refactors redaction
+  into a shared step so `.txt`/`.md`/`.docx` get the same protection as
+  `.pdf` already does.
+
+### 20.4 Step-by-Step Build Plan
+
+```text
+STEP F1   backend/ingest.py — load_text_file(file_path) -> list[Document]:
+          read the whole file as ONE Document (page_content = file text,
+          metadata = {"source": file_path, "page": None}). Covers both
+          .txt and .md (Markdown syntax is left as-is in the text — it
+          still embeds/reads fine, no need to strip it).
+
+STEP F2   backend/ingest.py — load_docx_file(file_path) -> list[Document]:
+          use python-docx to join every paragraph's text into ONE
+          Document (same shape as F1's output: page_content + {"source",
+          "page": None}).
+
+STEP F3   backend/ingest.py — load_document(file_path, include_images) ->
+          list[Document]: a dispatcher that picks load_pdf() /
+          load_text_file() / load_docx_file() by file extension. The
+          existing PII-redaction pass (_redact_pages(), Section 19.1) is
+          pulled out so it runs on EVERY format's output here, not just
+          inside load_pdf() — a shared, format-agnostic final step.
+          ingest_pdf() is renamed to ingest_document() (or kept as an
+          alias) and now calls load_document() instead of load_pdf()
+          directly.
+
+STEP F4   backend/main.py — extend the /upload endpoint's validation to
+          accept .pdf/.docx/.txt/.md and reject anything else with a
+          clear 400 error (same "validate before trusting" spirit as
+          safe_filename()'s path-traversal check).
+
+STEP F5   frontend/app.py — st.file_uploader(type=["pdf", "docx", "txt",
+          "md"]), update the upload section's label/help text away from
+          "PDF"-specific wording. Fix render_sources() to omit the
+          "— Page N" segment when a source has no page.
+
+STEP F6   requirements.txt — add python-docx.
+
+STEP F7   End-to-end test: upload a .txt, a .md, and a .docx file (one
+          each), ask a real question about each, confirm a correct
+          answer with a filename-only citation (no page); re-upload an
+          existing PDF and confirm its citations still show page numbers
+          exactly as before — this is the regression check that matters.
+```
+
+### 20.5 What Does NOT Change
+
+Retrieval, reranking, chunking, and the answer prompt are all completely
+format-agnostic already (they operate on `Document` objects regardless of
+where the text came from) — nothing about them changes. The PDF pipeline
+specifically (tables, OCR, its own PII redaction call site) is untouched;
+only the dispatch point and the now-shared redaction step are new.
+
+---
+
+## 21. Per-Thread Tunable Settings Panel — Implementation Plan
+
+### 21.1 What This Covers
+
+Five pipeline knobs that are currently fixed constants in `config.py`
+become live, per-thread-adjustable settings:
+
+| Setting | Config default | What it controls | Effect of raising it |
+|---|---|---|---|
+| `similarity_threshold` | 1.8 | "Weak evidence" cutoff (Rule 16) — a chunk only survives if its distance score is at or below this. **Lower score = more similar**, so raising the threshold = LOOSER (more chunks pass); lowering it = STRICTER (more "I don't know"). | Looser retrieval, less likely to falsely decline |
+| `retrieval_top_k` | 6 | How many chunks the reranker keeps for the final answer prompt. | More context reaches the LLM, more tokens/cost |
+| `rerank_candidate_k` | 15 | How wide the initial candidate pool is BEFORE reranking. | Better recall (less likely to miss a relevant chunk), slightly slower |
+| `rewrite_history_messages` | 6 | How many past messages the question-rewriter sees to resolve follow-ups. Setting this to **0 disables conversational memory entirely** (`rewrite_question()` already skips rewriting when there's no history to work with) — a free on/off toggle, no new code path needed. | Better follow-up resolution, one extra LLM call reads more context |
+| `llm_temperature` | 0 | How deterministic vs varied the final answer's phrasing is. | More varied phrasing — **caution: 0 is the safest default for a fact-grounded Q&A app; raising this is a real accuracy/consistency tradeoff, not a free customization, and the UI should say so.** |
+
+### 21.2 Decision: Persisted Per-Thread, One JSONB Column
+
+Same per-thread persistence decision as before, but with 5 knobs instead
+of 1, a single `settings JSONB` column on `threads` (not 5 separate
+columns) keeps this from being 5x the migration/plumbing work:
+- `NULL` or a missing key means "use the config default" for that knob.
+- Updating one setting only ever sends that one key — Postgres's `||`
+  jsonb-concatenation operator merges it into whatever's already stored,
+  so the frontend never needs to know the other 4 current values just to
+  change one.
+
+### 21.3 Step-by-Step Build Plan
+
+```text
+STEP AS1   backend/database.py — ALTER TABLE threads ADD COLUMN IF NOT
+           EXISTS settings JSONB. Update list_threads() to include it.
+           Add get_thread_settings(thread_id) -> dict (returns {} when
+           NULL) and update_thread_settings(thread_id, partial: dict) ->
+           dict, using
+           `settings = COALESCE(settings, '{}'::jsonb) || %s::jsonb`
+           for the merge.
+
+STEP AS2   backend/rag.py (or a new backend/settings.py) —
+           DEFAULT_SETTINGS = {the 5 config constants, by the names in
+           21.1's table} and resolve_settings(thread_settings: dict) ->
+           dict, returning {**DEFAULT_SETTINGS, **thread_settings}. One
+           place that knows how every knob falls back, instead of 5
+           separate `if x is None: x = CONFIG_CONST` checks scattered
+           around.
+
+STEP AS3   Thread each resolved setting through where the matching
+           constant is used TODAY:
+             - rag.py: similarity_threshold in the score filter,
+               rerank_candidate_k as retrieve_with_scores()'s k.
+             - reranker.py: rerank_chunks() gets a top_k param (currently
+               reads RETRIEVAL_TOP_K itself) for how many it keeps.
+             - rewriter.py: rewrite_question() gets a history_limit param
+               (currently reads REWRITE_HISTORY_MESSAGES itself).
+             - llm.py: get_llm() gets an optional temperature param
+               (currently hardcodes LLM_TEMPERATURE), falling back to the
+               config constant when not given.
+           generate_answer()/generate_answer_stream() take one new
+           `settings: dict` parameter (already-resolved, from AS2) and
+           pass the right piece to each. build_thinking() already shows
+           similarity_threshold — extend it to show all 5.
+
+STEP AS4   backend/main.py — GET /config/defaults ->  DEFAULT_SETTINGS
+           (single source of truth for the frontend); PATCH
+           /threads/{thread_id}/settings, body = a partial dict of any
+           of the 5 keys, calls update_thread_settings(). /query and
+           /query/stream resolve the active thread's settings via
+           get_thread_settings() + resolve_settings() before calling
+           generate_answer()/generate_answer_stream().
+
+STEP AS5   frontend/app.py — a "⚙️ Settings" expander in the sidebar with
+           5 sliders, each seeded from the active thread's resolved
+           settings (or GET /config/defaults when there's no thread
+           yet). Moving any one calls PATCH with just that one key.
+           Temperature's slider gets an explicit caution caption per
+           21.1. retrieval_top_k's slider max should stay <=
+           rerank_candidate_k's current value (a candidate pool smaller
+           than what you're asking to keep doesn't make sense) — enforce
+           with the slider's own min/max bounds reacting to the other's
+           current value, or just a caption noting the relationship.
+
+STEP AS6   End-to-end test, one per knob:
+             - similarity_threshold: strict vs loose, as before.
+             - retrieval_top_k: lower it to 1-2, confirm shorter/more
+               narrowly-sourced answers; confirm citations count matches.
+             - rerank_candidate_k: lower it below retrieval_top_k and
+               confirm the system still behaves sanely (reranker simply
+               can't keep more than it was given).
+             - rewrite_history_messages = 0: ask a follow-up question
+               ("his role?" after discussing a name) and confirm it NO
+               LONGER resolves the pronoun — conversational memory is
+               genuinely off.
+             - llm_temperature: raise it and ask the same question twice,
+               observe whether phrasing varies run to run.
+           For all 5: confirm "🧠 Show thinking" reflects the actual
+           resolved values, and that settings persist across a reload/
+           thread switch, independently per thread.
+```
+
+### 21.4 What Does NOT Change
+
+A thread that never has its settings touched behaves identically to
+today — `resolve_settings({})` returns exactly today's 5 hardcoded
+constants. Retrieval logic, reranking, and citations are unchanged in
+HOW they work; only WHERE each number comes from does.
