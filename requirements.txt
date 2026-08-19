@@ -13,3 +13,4 @@ requests
 psycopg[binary]
 pdfplumber
 python-docx
+cognee

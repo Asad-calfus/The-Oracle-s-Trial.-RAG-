@@ -22,6 +22,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCUMENTS_DIR = os.path.join(BASE_DIR, "data", "documents")
 CHROMA_DIR = os.path.join(BASE_DIR, "data", "chroma")
 LOGS_DIR = os.path.join(BASE_DIR, "data", "logs")
+GRAPHS_DIR = os.path.join(BASE_DIR, "data", "graphs")
 
 # --- Logging ---
 # DEBUG by default so every pipeline step is visible; override in .env
@@ -71,3 +72,11 @@ REWRITE_HISTORY_MESSAGES = 6
 # real relevance judgment is left to the strict LLM prompt below, which
 # actually reads the chunk instead of just measuring distance.
 SIMILARITY_SCORE_THRESHOLD = 1.8
+
+# --- Knowledge graph visualization (opt-in, Section 18) ---
+# A single small Wikibooks-chapter-sized document (~13K characters) already
+# took ~110 seconds and dozens of LLM calls to cognify() (see PLANNING.md
+# Section 17.6) — this cap keeps a single graph generation in roughly that
+# same ballpark, refusing anything that would run noticeably longer/costlier
+# instead of silently doing it.
+GRAPH_MAX_CHARS = 30_000

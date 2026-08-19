@@ -21,6 +21,7 @@ from backend.database import (
     update_thread_settings,
 )
 from backend.ingest import SUPPORTED_EXTENSIONS, ingest_document
+from backend.knowledge_graph import GraphTooLargeError, build_graph
 from backend.rag import generate_answer, generate_answer_stream
 from backend.settings import DEFAULT_SETTINGS
 from backend.vectorstore import list_documents
@@ -50,7 +51,8 @@ async def log_unhandled_exceptions(request: Request, exc: Exception):
     but never reaches app.log. This is very likely why an earlier `/upload`
     500 was never root-caused: app.log genuinely had nothing to show.
     HTTPException is intentionally NOT caught here — those are deliberate,
-    already-logged-if-relevant responses, not unexpected failures.
+    already-logged-if-relevant responses (like GraphTooLargeError's 400),
+    not unexpected failures.
     """
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
     return JSONResponse(
@@ -178,6 +180,35 @@ async def upload(
 async def documents(thread_id: int):
     logger.debug("GET /documents thread_id=%s", thread_id)
     return list_documents(thread_id)
+
+
+@app.post("/documents/graph")
+async def document_graph(filename: str, thread_id: int):
+    """Generate (or reuse) a knowledge-graph visualization for one document.
+
+    filename/thread_id are query params (not a path segment) so filenames
+    with spaces or special characters don't need manual URL-encoding.
+
+    Opt-in and per-document by design (Section 18) — this does real LLM
+    work the first time it's called for a given document, so it only runs
+    when a user explicitly asks for it, never automatically on upload.
+    Returns the raw HTML so the frontend can embed it inline.
+    """
+    logger.info("POST /documents/graph filename=%r thread_id=%s", filename, thread_id)
+
+    file_path = os.path.join(DOCUMENTS_DIR, str(thread_id), filename)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    try:
+        output_path = await build_graph(file_path, thread_id, filename)
+    except GraphTooLargeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    return {"html": html}
 
 
 @app.post("/threads")

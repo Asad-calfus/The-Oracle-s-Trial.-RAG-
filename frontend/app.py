@@ -16,6 +16,14 @@ st.title("SmartDoc — Document Q&A")
 if "active_thread_id" not in st.session_state:
     st.session_state.active_thread_id = None
 
+# Holds the last-generated graph's HTML (or an error), so it can be
+# rendered in the main area below the sidebar, outside the narrow sidebar
+# column — a force-directed graph needs real width to be readable.
+if "graph_html" not in st.session_state:
+    st.session_state.graph_html = None
+if "graph_error" not in st.session_state:
+    st.session_state.graph_error = None
+
 
 def render_sources(sources):
     """Show an answer's citations underneath it, each with a quoted excerpt.
@@ -123,6 +131,10 @@ with st.sidebar:
         # lazily by ensure_thread(), on whichever happens first: an upload
         # or a question.
         st.session_state.active_thread_id = None
+        # A graph generated for the previous chat's document has no business
+        # showing up under a brand new, document-less chat.
+        st.session_state.graph_html = None
+        st.session_state.graph_error = None
 
     for thread in fetch("/threads") or []:
         is_active = thread["id"] == st.session_state.active_thread_id
@@ -134,6 +146,10 @@ with st.sidebar:
             type="primary" if is_active else "secondary",
         ):
             st.session_state.active_thread_id = thread["id"]
+            # A graph belongs to the thread/document it was generated for —
+            # switching threads shouldn't carry it along.
+            st.session_state.graph_html = None
+            st.session_state.graph_error = None
             # Buttons above this one in the loop were already drawn using the
             # OLD active id, so their highlighting is stale — rerun to redraw
             # the whole sidebar consistently.
@@ -201,6 +217,33 @@ with st.sidebar:
         else:
             for document in documents:
                 st.caption(f"- {document['filename']} ({document['chunks']} chunks)")
+                if st.button(
+                    "🕸️ Knowledge graph",
+                    key=f"graph-{document['filename']}",
+                    help="Uses AI to extract entities/relationships from this "
+                    "document. The FIRST click can take 1-2 minutes and makes "
+                    "several AI calls; after that it's cached and instant. "
+                    "Refused for very large documents.",
+                ):
+                    with st.spinner("Building knowledge graph (first time only)..."):
+                        graph_response = requests.post(
+                            f"{API_BASE_URL}/documents/graph",
+                            params={
+                                "filename": document["filename"],
+                                "thread_id": active_thread_id,
+                            },
+                        )
+                    if graph_response.ok:
+                        st.session_state.graph_html = graph_response.json()["html"]
+                        st.session_state.graph_error = None
+                    else:
+                        st.session_state.graph_html = None
+                        try:
+                            detail = graph_response.json().get("detail", graph_response.text)
+                        except ValueError:
+                            detail = graph_response.text
+                        st.session_state.graph_error = detail
+                    st.rerun()
 
             # Narrowing further to specific files within THIS thread's own
             # documents — the thread boundary itself is already enforced
@@ -294,6 +337,14 @@ with st.sidebar:
 # upload, and the chat area below needs that fresh value, not a stale one
 # read before the sidebar ran.
 active_thread_id = st.session_state.active_thread_id
+
+# Rendered here (full page width), not inside the sidebar — a
+# force-directed graph needs real space to be readable.
+if st.session_state.graph_error:
+    st.error(f"Couldn't build knowledge graph: {st.session_state.graph_error}")
+if st.session_state.graph_html:
+    st.subheader("Knowledge Graph")
+    st.components.v1.html(st.session_state.graph_html, height=600, scrolling=True)
 
 # Replay the conversation from the database. Streamlit only shows what this
 # script renders right now, so past messages have to be drawn explicitly
