@@ -16,12 +16,22 @@ if "active_thread_id" not in st.session_state:
 
 
 def render_sources(sources):
-    """Show an answer's citations underneath it."""
+    """Show an answer's citations underneath it, each with a quoted excerpt.
+
+    Not every format has a page (Section 20.2 — .txt/.md/.docx have no
+    real pagination), so the "— Page N" segment only appears when a page
+    actually exists, instead of literally printing "— Page None".
+    """
     if not sources:
         return
     st.caption("Sources:")
     for source in sources:
-        st.caption(f"- {source['filename']} — Page {source['page']}")
+        page = source.get("page")
+        location = f"{source['filename']} — Page {page}" if page is not None else source["filename"]
+        st.caption(f"- {location}")
+        excerpt = source.get("excerpt")
+        if excerpt:
+            st.caption(f"   _\"{excerpt}\"_")
 
 
 def fetch(path):
@@ -76,20 +86,26 @@ with st.sidebar:
 
     st.divider()
 
-    st.header("Upload a PDF")
-    uploaded_file = st.file_uploader("Choose a PDF", type="pdf")
+    st.header("Upload a document")
+    uploaded_file = st.file_uploader(
+        "Choose a document", type=["pdf", "docx", "txt", "md"]
+    )
     include_images = st.checkbox(
         "Describe images (charts/diagrams/scanned pages) using AI",
-        help="Uses a vision AI call per image-containing page, so it costs "
-        "a little extra and takes longer. Leave unchecked for plain-text PDFs.",
+        help="PDF only. Uses a vision AI call per image-containing page, "
+        "so it costs a little extra and takes longer. Leave unchecked for "
+        "plain-text PDFs, or when uploading a .docx/.txt/.md file.",
     )
     if uploaded_file is not None and st.button("Upload"):
         # This chat's own document, tagged with this chat's own thread —
         # that tag is what keeps it invisible to every other chat's search.
         thread_id = ensure_thread(f"Chat about {uploaded_file.name}")
 
+        # uploaded_file.type is whatever the browser reported — correct
+        # per-format, unlike a single hardcoded "application/pdf" would be
+        # now that more than one file type is accepted.
         files = {
-            "file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")
+            "file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)
         }
         spinner_text = "Ingesting (describing images)..." if include_images else "Ingesting..."
         with st.spinner(spinner_text):
@@ -119,7 +135,7 @@ with st.sidebar:
     if active_thread_id is None:
         # A brand new chat has no thread yet, so it can't have documents
         # yet either — nothing to fetch.
-        st.caption("Upload a PDF above to start this chat.")
+        st.caption("Upload a document above to start this chat.")
     else:
         documents = fetch(f"/documents?thread_id={active_thread_id}")
 

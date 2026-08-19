@@ -15,7 +15,7 @@ from backend.database import (
     init_db,
     list_threads,
 )
-from backend.ingest import ingest_pdf
+from backend.ingest import SUPPORTED_EXTENSIONS, ingest_document
 from backend.rag import generate_answer
 from backend.vectorstore import list_documents
 
@@ -62,6 +62,16 @@ def safe_filename(filename: Optional[str]) -> str:
     if not name or name in {".", ".."}:
         raise HTTPException(status_code=400, detail="Invalid filename.")
 
+    # Reject unsupported types here, before a file is ever written to disk
+    # or handed to ingest_document() — same "validate before trusting"
+    # spirit as the checks above (Section 20.4/F4).
+    extension = os.path.splitext(name)[1].lower()
+    if extension not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type {extension!r}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}.",
+        )
+
     return name
 
 
@@ -93,7 +103,7 @@ async def upload(
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    result = ingest_pdf(file_path, thread_id, include_images=include_images)
+    result = ingest_document(file_path, thread_id, include_images=include_images)
 
     return {
         # Return the sanitized name, not the raw one — this is the name the
