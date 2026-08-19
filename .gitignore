@@ -27,3 +27,7 @@ data/documents/*
 
 # Local experiment output — may contain PII from test documents
 compare_rerank_results.json
+
+# Generated graph visualization output from experiments/ scripts — large,
+# regenerable, not source
+experiments/graph_visualization.html
