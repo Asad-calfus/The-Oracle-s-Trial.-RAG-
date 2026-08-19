@@ -3,8 +3,10 @@ import logging.handlers
 import os
 
 # Third-party libraries log a lot of noise at DEBUG (HTTP request/response
-# bodies, connection pool internals) that would drown out our own log lines.
-NOISY_LOGGERS = ("httpx", "httpcore", "openai", "urllib3")
+# bodies, connection pool internals, per-token PDF parsing) that would
+# drown out our own log lines. pdfminer/pdfplumber in particular logs one
+# line per PDF token parsed — effectively unusable at DEBUG on a real PDF.
+NOISY_LOGGERS = ("httpx", "httpcore", "openai", "urllib3", "pdfminer", "pdfplumber")
 
 
 def setup_logging(logs_dir: str, level: str):
@@ -36,6 +38,12 @@ def setup_logging(logs_dir: str, level: str):
     file_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
+    # Clear first: a third-party library imported after this (e.g. cognee,
+    # which configures its own logging on import) can otherwise wipe out or
+    # sit alongside these handlers, silently stopping our own log lines from
+    # reaching app.log. Calling setup_logging() again after such an import
+    # (see knowledge_graph.py) resets things back to just our own handlers.
+    root_logger.handlers.clear()
     root_logger.setLevel(level)
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)

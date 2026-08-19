@@ -4,7 +4,8 @@ import shutil
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.config import DOCUMENTS_DIR
@@ -31,6 +32,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def log_unhandled_exceptions(request: Request, exc: Exception):
+    """Log the real traceback for ANY unhandled exception before returning
+    a generic 500.
+
+    Without this, FastAPI/Starlette's own default handler deals with the
+    exception using uvicorn's logging setup — a separate logger tree from
+    this project's own (logging_config.py) — so it shows in the terminal
+    but never reaches app.log. This is very likely why an earlier `/upload`
+    500 was never root-caused: app.log genuinely had nothing to show.
+    HTTPException is intentionally NOT caught here — those are deliberate,
+    already-logged-if-relevant responses, not unexpected failures.
+    """
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Check the server logs."},
+    )
 
 
 class QueryRequest(BaseModel):
